@@ -1,0 +1,7 @@
+/target
+.jira-kanban-tui.toml
+.jira-kanban-tui.log
+*.tmp
+.DS_Store
+
+AGENTS.md
