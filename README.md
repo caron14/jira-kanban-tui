@@ -1,66 +1,123 @@
 # jira-kanban-tui
 
-A focused Jira Kanban TUI for checking project health and making the four updates used every day:
-Status, Assignee, Due date, and Priority.
+A focused terminal app for Jira Software. Check project health, browse a Board, review its WBS and
+recent activity, and make the four updates commonly needed during the day:
 
-## Requirements
+- Status
+- Assignee
+- Due date
+- Priority
 
-- Jira Software Cloud or Jira Software Data Center
-- A Jira account that can view the configured Boards and Issues
-- Permission to edit Status, Assignee, Due date, or Priority when those updates are needed
-- A terminal of at least 80×24 cells
-- Rust 1.75 or later when building from source
+Edits always require an explicit selection or value followed by Enter. Mouse dragging never changes
+Jira, and cached data is read-only.
 
-## Install
+## Get started
+
+### 1. Prepare Jira access
+
+You need:
+
+- Jira Software Cloud, or Jira Software Data Center 8.14 or later
+- Access to the Boards and Issues you want to view
+- Jira permission to edit any of the four supported fields you intend to change
+- The numeric ID of at least one Jira Board
+
+For Jira Cloud, create an API token in your
+[Atlassian account](https://support.atlassian.com/atlassian-account/docs/manage-api-tokens-for-your-atlassian-account/).
+Use a token without scopes; scoped tokens require a different Atlassian API URL that this app does
+not currently use.
+
+For Jira Data Center, create a Personal Access Token from Profile > Personal access tokens. See
+[Atlassian's PAT guide](https://confluence.atlassian.com/enterprise/using-personal-access-tokens-1026032365.html).
+
+To find a Board ID, open the Board in Jira and look for the number in its URL. Depending on your Jira
+version, it may appear as `rapidView=123` or `/boards/123`. Ask your Jira administrator if the Board
+URL does not expose it.
+
+### 2. Build and run
+
+Rust 1.75 or later is required when building from source.
 
 ```sh
 cargo build --locked --release
 ./target/release/jira-kanban-tui
 ```
 
+Use a terminal window of at least 80 columns by 24 rows.
+
+### 3. Complete Setup
+
 The first launch opens a two-step Setup:
 
-1. Select Jira Cloud or Jira Data Center, then enter the base URL and API Token or PAT. Jira
-   Cloud also requires your email address.
-2. Add one or more numeric Board IDs. Every Board is verified and shown by name before the Config
-   is saved.
+1. Choose Jira Cloud or Data Center, then enter the Jira base URL and Token. Jira Cloud also asks
+   for your Atlassian account email address.
+2. Enter each Board ID. The app verifies every Board and shows its name before saving.
 
-Open a Board in Jira to find its numeric ID in the URL. Depending on the Jira version, it may appear
-as `rapidView=123` or `/boards/123`. If the URL does not expose it, ask your Jira administrator.
+| Action | Key |
+| --- | --- |
+| Move between fields | `Tab` / `Shift+Tab` |
+| Choose Cloud or Data Center | `Left` / `Right` |
+| Verify the connection or add a Board | `Enter` |
+| Remove the last added Board | `Delete` |
+| Show or hide the Token | `Ctrl+T` |
+| Save and open the Dashboard | `Ctrl+S` |
+| Quit Setup | `Esc`, then confirm |
 
-Setup controls:
-
-- `Tab` / `Shift+Tab` moves between fields; `←/→` selects Cloud or Data Center
-- `Enter` verifies the connection or adds the entered Board
-- `Delete` removes the last Board; `Ctrl+S` saves and opens the Dashboard
-- `Ctrl+T` toggles Token visibility; `Esc` asks before quitting Setup
-
-Setup stores the Token in the OS keyring and never writes it to the Config file. If a usable keyring
-is not available, create the Config manually and use `token_env` or `token_command` instead. Do not
-put a Token directly in `token_command` arguments.
+Setup stores the Token in the OS keyring and never writes it to the Config file. If no usable
+keyring is available, use the manual credential options described below.
 
 ## Daily use
 
-The app starts on the Dashboard for the selected Board.
+The app opens on the Dashboard for the selected Board.
 
-- `1` Board, `2` Dashboard, `3` WBS, `4` Activity
-- `j/k` or `↑/↓` select an item
-- `h/l` or `←/→` select a Board column; in WBS they collapse or expand
-- `Enter` opens Issue details
-- `e` opens one Edit menu: Status, Assignee, Due date, Priority
-- In the Board view, `/` searches Key, Summary, and Assignee
-- In the Board view, `f` filters by My Issues, Overdue, or Blocked
-- `b` selects a configured Board
-- `o` opens Jira, `r` refreshes, and `?` shows contextual help
-- `q` quits the main UI; Setup uses `Esc` so `q` can be entered normally
+| Action | Key |
+| --- | --- |
+| Open Board, Dashboard, WBS, or Activity | `1`, `2`, `3`, `4` |
+| Move through Issues or activity | `j` / `k` or `Down` / `Up` |
+| Move between Board columns | `h` / `l` or `Left` / `Right` |
+| Collapse or expand a WBS item | `h` / `l` or `Left` / `Right` |
+| Open Issue details | `Enter` |
+| Edit Status, Assignee, Due date, or Priority | `e` |
+| Open the selected Issue in Jira | `o` |
+| Choose another configured Board | `b` |
+| Refresh | `r` |
+| Show contextual help | `?` |
+| Quit | `q` or `Ctrl+C` |
 
-All edits require a visible choice or value followed by Enter. Cached data is clearly marked
-read-only and cannot be edited. Mouse input can select tabs and items or scroll; dragging never
-updates Jira.
+Search and filters are available in the Board view:
 
-## Config
+- `/` searches Issue Key, Summary, and Assignee
+- `f` filters by My Issues, Overdue, or Blocked
 
-The default path is `~/.jira-kanban-tui.toml`; use `--config` to select another file.
+Mouse input can select tabs and items or scroll. It cannot update an Issue.
+
+## If something goes wrong
+
+Run the built-in diagnostic before changing the Config:
+
+```sh
+jira-kanban-tui doctor
+```
+
+It checks the Config, credential, current Jira user, and every configured Board without printing
+secrets. For a non-default Config or a one-time Board override, use:
+
+```sh
+jira-kanban-tui --config /path/to/config.toml doctor
+jira-kanban-tui --board 123
+```
+
+Common behavior:
+
+- Missing or invalid credentials reopen Setup so they can be repaired.
+- A network failure uses the last cache when available and clearly marks it read-only.
+- A terminal smaller than 80x24 shows the required size instead of a broken layout.
+- `-v` and `-vv` increase log detail when diagnosing a problem.
+
+## Manual Config and credentials
+
+Most users do not need to edit the Config. Its default path is `~/.jira-kanban-tui.toml`; use
+`--config` to select another file.
 
 ```toml
 version = 3
@@ -77,29 +134,22 @@ token_command = ["op", "read", "op://Engineering/Jira/token"] # optional fallbac
 For Jira Data Center, use `auth = "data_center_bearer_pat"` and omit `username`.
 
 Credential lookup order is OS keyring, `token_env`, then `token_command`. The command is an argv
-array and is never passed through a shell.
+array and is never passed through a shell. Do not place a Token directly in the command arguments.
+
+### Config v2 migration
 
 Config v2 is migrated automatically only when it contains exactly one Jira source. The original is
-retained as `<config>.v2.bak`. Configs with multiple sources or GitHub/Linear are left untouched with
-a specific migration error so no configuration is silently discarded.
-
-## Diagnose
-
-```sh
-jira-kanban-tui doctor
-jira-kanban-tui --config /path/to/config.toml doctor
-jira-kanban-tui --board 123
-```
-
-`doctor` checks the Config, credential, current user, and every configured Board without printing
-secrets. `--board` is an ephemeral override for one launch.
+kept as `<config>.v2.bak`. Configs with multiple sources or GitHub/Linear are left untouched and show
+a migration error, so unsupported configuration is never silently discarded.
 
 ## Local data and privacy
 
-- Config: `~/.jira-kanban-tui.toml`; contains connection settings but no Token
-- Credentials: OS keyring, or the configured environment variable or command
-- Cache: `~/.jira-kanban-tui-cache/`; contains Board and Issue data for read-only offline use
-- Log: `~/.jira-kanban-tui.log`; credentials are not logged
+| Data | Default location | Contents |
+| --- | --- | --- |
+| Config | `~/.jira-kanban-tui.toml` | Jira URL, authentication type, and Board IDs; no Token |
+| Credentials | OS keyring | API Token or PAT entered during Setup |
+| Cache | `~/.jira-kanban-tui-cache/` | Board and Issue data for read-only offline use |
+| Log | `~/.jira-kanban-tui.log` | Diagnostics with credentials excluded |
 
 On Unix, Config, cache files, migration backups, and the log are written with mode `0600`. Treat the
 cache as project data and do not commit or share it.
@@ -119,4 +169,4 @@ Before release, also complete the [release gates](docs/release-checklist.md) and
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
