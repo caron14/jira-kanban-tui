@@ -1,0 +1,9 @@
+/target
+
+.jira-kanban-tui.toml
+.jira-kanban-tui.log
+.jira-kanban-tui-cache/
+*.v2.bak
+*.tmp
+
+.DS_Store
