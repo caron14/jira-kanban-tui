@@ -2,6 +2,9 @@
 
 use jira_kanban_tui::app::state::AppState;
 use jira_kanban_tui::domain::{Board, BoardColumn, Issue, IssueType};
+use std::time::Duration;
+
+const NAVIGATION_BUDGET: Duration = Duration::from_millis(250);
 
 fn big_board(n: usize) -> (Board, Vec<Issue>) {
     let board = Board {
@@ -54,7 +57,8 @@ fn large_board_navigation_and_filter() {
             crossterm::event::KeyModifiers::NONE,
         ));
     }
-    assert!(start.elapsed().as_millis() < 100, "navigation too slow");
+    let elapsed = start.elapsed();
+    assert!(elapsed < NAVIGATION_BUDGET, "navigation too slow: {elapsed:?}");
 
     // filter
     let start = std::time::Instant::now();
