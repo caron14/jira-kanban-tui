@@ -34,16 +34,29 @@ To find a Board ID, open the Board in Jira and look for the number in its URL. D
 version, it may appear as `rapidView=123` or `/boards/123`. Ask your Jira administrator if the Board
 URL does not expose it.
 
-### 2. Build and run
+### 2. Install and run
 
-Rust 1.75 or later is required when building from source.
+Install [Rust](https://www.rust-lang.org/tools/install) 1.75 or later and Git, then install the app
+from the repository:
 
 ```sh
-cargo build --locked --release
-./target/release/jira-kanban-tui
+git clone https://github.com/sho/jira-kanban-tui.git
+cd jira-kanban-tui
+cargo install --locked --path .
+jira-kanban-tui
 ```
 
-Use a terminal window of at least 80 columns by 24 rows.
+`cargo install` normally places the executable in `~/.cargo/bin`. If your shell cannot find
+`jira-kanban-tui`, add that directory to `PATH` as described by the Rust installer, or run
+`~/.cargo/bin/jira-kanban-tui` directly.
+
+To try the app without installing it, run this from the repository instead:
+
+```sh
+cargo run --locked --release
+```
+
+Use a terminal window of at least 80 columns by 24 rows. The first launch starts the guided Setup.
 
 ### 3. Complete Setup
 
@@ -70,6 +83,10 @@ keyring is available, use the manual credential options described below.
 
 The app opens on the Dashboard for the selected Board.
 
+A typical workflow is: press `1` to open the Board, select an Issue with `j` / `k`, press `Enter`
+to inspect it, and press `e` to edit it. Select an edit and confirm the new value with `Enter`.
+Press `Esc` to close any dialog without continuing.
+
 | Action | Key |
 | --- | --- |
 | Open Board, Dashboard, WBS, or Activity | `1`, `2`, `3`, `4` |
@@ -90,6 +107,13 @@ Search and filters are available in the Board view:
 - `f` filters by My Issues, Overdue, or Blocked
 
 Mouse input can select tabs and items or scroll. It cannot update an Issue.
+
+When editing an Issue:
+
+- Status and Priority are selected with `j` / `k` or `Down` / `Up`, then confirmed with `Enter`.
+- Type to search for an Assignee; press `Delete` to unassign the Issue.
+- Enter a Due date as `YYYY-MM-DD`; submit an empty value to clear it.
+- Updates are sent only after an explicit value or choice is confirmed with `Enter`.
 
 ## If something goes wrong
 
@@ -136,6 +160,24 @@ For Jira Data Center, use `auth = "data_center_bearer_pat"` and omit `username`.
 Credential lookup order is OS keyring, `token_env`, then `token_command`. The command is an argv
 array and is never passed through a shell. Do not place a Token directly in the command arguments.
 
+If the OS keyring is unavailable, create the Config above at `~/.jira-kanban-tui.toml` and choose
+one credential fallback. For `token_env`, set the named environment variable before starting the
+app:
+
+```sh
+printf "Jira Token: "
+read -r -s JIRA_API_TOKEN
+printf "\n"
+export JIRA_API_TOKEN
+jira-kanban-tui doctor
+jira-kanban-tui
+unset JIRA_API_TOKEN
+```
+
+The `read` command above accepts the Token without displaying it or storing it in shell history.
+Alternatively, configure `token_command` to retrieve it from a password manager, as in the Config
+example.
+
 ### Config v2 migration
 
 Config v2 is migrated automatically only when it contains exactly one Jira source. The original is
@@ -153,6 +195,21 @@ a migration error, so unsupported configuration is never silently discarded.
 
 On Unix, Config, cache files, migration backups, and the log are written with mode `0600`. Treat the
 cache as project data and do not commit or share it.
+
+## Update or uninstall
+
+From an existing repository checkout, update and reinstall with:
+
+```sh
+git pull --ff-only
+cargo install --locked --path . --force
+```
+
+To remove the installed executable:
+
+```sh
+cargo uninstall jira-kanban-tui
+```
 
 ## Development
 
