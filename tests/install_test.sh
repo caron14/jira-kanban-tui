@@ -2,7 +2,7 @@
 
 set -eu
 
-REPOSITORY_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/jira-kanban-tui-installer-test.XXXXXX")
 
 cleanup() {

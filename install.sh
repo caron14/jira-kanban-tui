@@ -109,6 +109,6 @@ case ":${PATH:-}:" in
     *:"${INSTALL_DIR}":*) ;;
     *)
         printf '%s\n' "Add ${INSTALL_DIR} to PATH before running ${BINARY_NAME}:"
-        printf '  export PATH="%s:$PATH"\n' "$INSTALL_DIR"
+        printf "  export PATH=\"%s:\$PATH\"\n" "$INSTALL_DIR"
         ;;
 esac
