@@ -1,6 +1,6 @@
 [package]
 name = "jira-kanban-tui"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A focused Jira Kanban TUI for daily project management"
 license = "MIT"

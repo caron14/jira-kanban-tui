@@ -37,12 +37,14 @@
 ## Publishing
 
 1. Complete the behavior, quality, terminal compatibility, and distribution gates.
-2. Update `Cargo.toml` to the next unused semantic version and commit the change.
-3. Create and push the matching tag, for example `git tag v0.1.1` followed by
+2. Update `Cargo.toml` to the next unused semantic version, then commit and push the release branch.
+3. Run the Release workflow manually from that branch and confirm all four build jobs succeed. A
+   manual run builds and packages every target but does not create a GitHub Release.
+4. Create and push the matching tag, for example `git tag v0.1.1` followed by
    `git push origin v0.1.1`.
-4. Confirm that the Release workflow creates a draft, uploads and attests all six assets, and only
-   then publishes the GitHub Release.
-5. Test the latest and version-pinned installer commands from the published Release.
+5. Confirm that the tag-triggered workflow creates a draft, uploads and attests all six assets, and
+   only then publishes the GitHub Release.
+6. Test the latest and version-pinned installer commands from the published Release.
 
 Enable immutable releases in the GitHub repository settings when available. The workflow assembles
 all assets in a draft before publishing so it remains compatible with immutable releases.
