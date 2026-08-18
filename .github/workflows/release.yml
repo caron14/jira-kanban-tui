@@ -152,10 +152,6 @@ jobs:
         run: |
           set -euo pipefail
           existing_draft=$(gh release view "${TAG}" --json isDraft --jq .isDraft 2>/dev/null || true)
-          if [[ -n "${existing_draft}" && "${existing_draft}" != "true" ]]; then
-            echo "Release ${TAG} already exists and is not a draft" >&2
-            exit 1
-          fi
           if [[ -z "${existing_draft}" ]]; then
             gh release create "${TAG}" --draft --verify-tag --generate-notes --title "${TAG}"
           fi
