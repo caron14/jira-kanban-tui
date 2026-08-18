@@ -36,21 +36,37 @@ URL does not expose it.
 
 ### 2. Install and run
 
-Install [Rust](https://www.rust-lang.org/tools/install) 1.75 or later and Git, then install the app
-from the repository:
+Install the latest release on macOS or Linux:
 
 ```sh
-git clone https://github.com/sho/jira-kanban-tui.git
-cd jira-kanban-tui
-cargo install --locked --path .
+curl -LsSf https://github.com/caron14/jira-kanban-tui/releases/latest/download/install.sh | sh
 jira-kanban-tui
 ```
 
-`cargo install` normally places the executable in `~/.cargo/bin`. If your shell cannot find
-`jira-kanban-tui`, add that directory to `PATH` as described by the Rust installer, or run
-`~/.cargo/bin/jira-kanban-tui` directly.
+The installer supports Intel and Apple Silicon macOS and x86_64 and arm64 Linux. It verifies the
+downloaded archive and installs the executable in `~/.local/bin` without `sudo`. If that directory
+is not already in `PATH`, follow the command printed by the installer. To choose another directory
+or install a specific version, set an installer environment variable:
 
-To try the app without installing it, run this from the repository instead:
+```sh
+curl -LsSf https://github.com/caron14/jira-kanban-tui/releases/latest/download/install.sh \
+  | env JIRA_KANBAN_TUI_INSTALL_DIR=/custom/bin sh
+curl -LsSf https://github.com/caron14/jira-kanban-tui/releases/latest/download/install.sh \
+  | env JIRA_KANBAN_TUI_VERSION=0.1.1 sh
+```
+
+To build and install from source instead, install
+[Rust](https://www.rust-lang.org/tools/install) 1.75 or later and Git, then run:
+
+```sh
+git clone https://github.com/caron14/jira-kanban-tui.git
+cd jira-kanban-tui
+cargo install --locked --path .
+```
+
+`cargo install` normally places its executable in `~/.cargo/bin`.
+
+To try a source checkout without installing it, run:
 
 ```sh
 cargo run --locked --release
@@ -198,14 +214,27 @@ cache as project data and do not commit or share it.
 
 ## Update or uninstall
 
-From an existing repository checkout, update and reinstall with:
+Re-run the installer to replace an existing release installation with the latest version:
+
+```sh
+curl -LsSf https://github.com/caron14/jira-kanban-tui/releases/latest/download/install.sh | sh
+```
+
+To remove a default release installation, delete the executable. Config, credentials, cache, and
+logs are intentionally left in place:
+
+```sh
+rm ~/.local/bin/jira-kanban-tui
+```
+
+From an existing source checkout, update and reinstall with:
 
 ```sh
 git pull --ff-only
 cargo install --locked --path . --force
 ```
 
-To remove the installed executable:
+To remove an executable installed by Cargo:
 
 ```sh
 cargo uninstall jira-kanban-tui
