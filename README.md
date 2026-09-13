@@ -20,7 +20,6 @@ You need:
 - Jira Software Cloud, or Jira Software Data Center 8.14 or later
 - Access to the Boards and Issues you want to view
 - Jira permission to edit any of the four supported fields you intend to change
-- The numeric ID of at least one Jira Board
 
 For Jira Cloud, create an API token in your
 [Atlassian account](https://support.atlassian.com/atlassian-account/docs/manage-api-tokens-for-your-atlassian-account/).
@@ -29,10 +28,6 @@ not currently use.
 
 For Jira Data Center, create a Personal Access Token from Profile > Personal access tokens. See
 [Atlassian's PAT guide](https://confluence.atlassian.com/enterprise/using-personal-access-tokens-1026032365.html).
-
-To find a Board ID, open the Board in Jira and look for the number in its URL. Depending on your Jira
-version, it may appear as `rapidView=123` or `/boards/123`. Ask your Jira administrator if the Board
-URL does not expose it.
 
 ### 2. Install and run
 
@@ -52,7 +47,7 @@ or install a specific version, set an installer environment variable:
 curl -LsSf https://github.com/caron14/jira-kanban-tui/releases/latest/download/install.sh \
   | env JIRA_KANBAN_TUI_INSTALL_DIR=/custom/bin sh
 curl -LsSf https://github.com/caron14/jira-kanban-tui/releases/latest/download/install.sh \
-  | env JIRA_KANBAN_TUI_VERSION=0.1.1 sh
+  | env JIRA_KANBAN_TUI_VERSION=0.1.2 sh
 ```
 
 To build and install from source instead, install
@@ -78,19 +73,20 @@ Use a terminal window of at least 80 columns by 24 rows. The first launch starts
 
 The first launch opens a two-step Setup:
 
-1. Choose Jira Cloud or Data Center, then enter the Jira base URL and Token. Jira Cloud also asks
-   for your Atlassian account email address.
-2. Enter each Board ID. The app verifies every Board and shows its name before saving.
+1. Paste a Jira URL and enter the Token. Setup detects Cloud or Data Center from the URL; use
+   Left/Right on the detected type only when you need to override it. Jira Cloud also asks for your
+   Atlassian account email address.
+2. Select an accessible Board by name. Use Space before Enter to select more than one Board.
 
 | Action | Key |
 | --- | --- |
-| Move between fields | `Tab` / `Shift+Tab` |
+| Move between fields or Boards | `Up` / `Down` or `Tab` / `Shift+Tab` |
 | Choose Cloud or Data Center | `Left` / `Right` |
-| Verify the connection or add a Board | `Enter` |
-| Remove the last added Board | `Delete` |
+| Verify the connection or use the selected Board(s) | `Enter` |
+| Select multiple Boards | `Space` |
 | Show or hide the Token | `Ctrl+T` |
-| Save and open the Dashboard | `Ctrl+S` |
-| Quit Setup | `Esc`, then confirm |
+| Return from Board selection | `Esc` |
+| Quit Setup | `Esc` from connection settings, then confirm |
 
 Setup stores the Token in the OS keyring and never writes it to the Config file. If no usable
 keyring is available, use the manual credential options described below.
@@ -100,8 +96,8 @@ keyring is available, use the manual credential options described below.
 The app opens on the Dashboard for the selected Board.
 
 A typical workflow is: press `1` to open the Board, select an Issue with `j` / `k`, press `Enter`
-to inspect it, and press `e` to edit it. Select an edit and confirm the new value with `Enter`.
-Press `Esc` to close any dialog without continuing.
+to inspect it, select Status, Assignee, Due date, or Priority with the arrows, and press `Enter` to
+edit that field. Press `Esc` to return or close a dialog without continuing.
 
 | Action | Key |
 | --- | --- |
@@ -109,8 +105,7 @@ Press `Esc` to close any dialog without continuing.
 | Move through Issues or activity | `j` / `k` or `Down` / `Up` |
 | Move between Board columns | `h` / `l` or `Left` / `Right` |
 | Collapse or expand a WBS item | `h` / `l` or `Left` / `Right` |
-| Open Issue details | `Enter` |
-| Edit Status, Assignee, Due date, or Priority | `e` |
+| Open editable Issue details | `Enter` or `e` |
 | Open the selected Issue in Jira | `o` |
 | Choose another configured Board | `b` |
 | Refresh | `r` |
@@ -122,13 +117,15 @@ Search and filters are available in the Board view:
 - `/` searches Issue Key, Summary, and Assignee
 - `f` filters by My Issues, Overdue, or Blocked
 
-Mouse input can select tabs and items or scroll. It cannot update an Issue.
+Mouse input can select tabs and items, scroll, complete Setup, and update an Issue. Click outside a
+dialog to return without making a change.
 
 When editing an Issue:
 
 - Status and Priority are selected with `j` / `k` or `Down` / `Up`, then confirmed with `Enter`.
-- Type to search for an Assignee; press `Delete` to unassign the Issue.
-- Enter a Due date as `YYYY-MM-DD`; submit an empty value to clear it.
+- Choose Assign to me or Unassign before searching for another Assignee.
+- Choose Today, Tomorrow, One week from today, or Clear due date; a custom `YYYY-MM-DD` value is
+  also available.
 - Updates are sent only after an explicit value or choice is confirmed with `Enter`.
 
 ## If something goes wrong
@@ -172,6 +169,8 @@ token_command = ["op", "read", "op://Engineering/Jira/token"] # optional fallbac
 ```
 
 For Jira Data Center, use `auth = "data_center_bearer_pat"` and omit `username`.
+HTTPS is required by default. For a trusted internal Data Center instance that is only available
+over HTTP, select `Allow insecure HTTP` in Setup or set `allow_insecure_http = true` explicitly.
 
 Credential lookup order is OS keyring, `token_env`, then `token_command`. The command is an argv
 array and is never passed through a shell. Do not place a Token directly in the command arguments.
