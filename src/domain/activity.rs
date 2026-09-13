@@ -21,17 +21,18 @@ pub struct Activity {
     pub at: DateTime<Utc>,
 }
 
-pub fn collect_activity(issues: &[Issue], since: DateTime<Utc>) -> Vec<Activity> {
+pub fn collect_activity(
+    issues: &[Issue],
+    since: DateTime<Utc>,
+    done_statuses: &[String],
+) -> Vec<Activity> {
     let mut acts = Vec::new();
     for iss in issues {
         if let Some(updated) = iss.updated {
             if updated < since {
                 continue;
             }
-            // Heuristic: if status == Done and updated is recent, treat as Completed
-            if iss.status.to_lowercase().contains("done")
-                || iss.status.to_lowercase().contains("closed")
-            {
+            if done_statuses.contains(&iss.status) {
                 acts.push(Activity {
                     key: iss.key.clone(),
                     summary: iss.summary.clone(),
@@ -99,7 +100,7 @@ mod tests {
                 overdue: false,
             },
         ];
-        let acts = collect_activity(&issues, now - Duration::days(1));
+        let acts = collect_activity(&issues, now - Duration::days(1), &["Done".into()]);
         assert_eq!(acts.len(), 1);
         assert_eq!(acts[0].key, "P-1");
     }

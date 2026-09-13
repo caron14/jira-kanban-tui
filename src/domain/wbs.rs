@@ -17,19 +17,19 @@ pub fn build_wbs(issues: &[Issue], done_statuses: &[String]) -> Vec<WbsNode> {
     }
     // parent -> children keys
     let mut children_map: HashMap<String, Vec<String>> = HashMap::new();
-    let mut orphan_keys = Vec::new();
+    let mut child_keys = HashSet::new();
     for iss in issues {
         if let Some(parent) = &iss.parent_key {
             if by_key.contains_key(parent) {
                 children_map.entry(parent.clone()).or_default().push(iss.key.clone());
-            } else {
-                orphan_keys.push(iss.key.clone());
+                child_keys.insert(iss.key.clone());
             }
         }
         // Epic link as parent fallback
         if let Some(epic) = &iss.epic_key {
             if iss.parent_key.is_none() && by_key.contains_key(epic) {
                 children_map.entry(epic.clone()).or_default().push(iss.key.clone());
+                child_keys.insert(iss.key.clone());
             }
         }
     }
@@ -38,14 +38,7 @@ pub fn build_wbs(issues: &[Issue], done_statuses: &[String]) -> Vec<WbsNode> {
     let mut roots = Vec::new();
     let mut visited = HashSet::new();
     for iss in issues {
-        let is_child = issues.iter().any(|p| {
-            if let Some(children) = children_map.get(&p.key) {
-                children.contains(&iss.key)
-            } else {
-                false
-            }
-        });
-        if !is_child {
+        if !child_keys.contains(&iss.key) {
             if let Some(node) =
                 build_node(iss, &by_key, &children_map, done_statuses, 0, &mut visited)
             {
@@ -53,15 +46,13 @@ pub fn build_wbs(issues: &[Issue], done_statuses: &[String]) -> Vec<WbsNode> {
             }
         }
     }
-    // Add orphans that were missed due to cycle
-    for key in orphan_keys {
-        if !visited.contains(&key) {
-            if let Some(iss) = by_key.get(&key) {
-                if let Some(node) =
-                    build_node(iss, &by_key, &children_map, done_statuses, 0, &mut visited)
-                {
-                    roots.push(node);
-                }
+    // Cycles have no natural root. Keep one representative tree visible instead of dropping it.
+    for issue in issues {
+        if !visited.contains(&issue.key) {
+            if let Some(node) =
+                build_node(issue, &by_key, &children_map, done_statuses, 0, &mut visited)
+            {
+                roots.push(node);
             }
         }
     }
@@ -148,8 +139,8 @@ mod tests {
         let issues =
             vec![issue("A", Some("B"), None, "To Do"), issue("B", Some("A"), None, "To Do")];
         let roots = build_wbs(&issues, &["Done".into()]);
-        // Should not panic, may be empty due to cycle
-        assert!(roots.len() <= 2);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].children.len(), 1);
     }
 
     #[test]

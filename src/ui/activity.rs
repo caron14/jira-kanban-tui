@@ -7,6 +7,18 @@ use ratatui::{
     Frame,
 };
 
+use super::layout::SelectableListRegion;
+
+pub fn hit_test(
+    area: Rect,
+    item_count: usize,
+    selected: usize,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    SelectableListRegion { area, item_count, selected, row_height: 1 }.hit(column, row)
+}
+
 pub fn render_activity(frame: &mut Frame, area: Rect, activities: &[Activity], selected: usize) {
     let lines = activities
         .iter()
@@ -34,8 +46,9 @@ pub fn render_activity(frame: &mut Frame, area: Rect, activities: &[Activity], s
             }
         })
         .collect::<Vec<_>>();
-    let visible = usize::from(area.height.saturating_sub(2));
-    let scroll = selected.saturating_sub(visible.saturating_sub(1));
+    let scroll =
+        SelectableListRegion { area, item_count: activities.len(), selected, row_height: 1 }
+            .scroll();
     let paragraph = if lines.is_empty() {
         Paragraph::new("No changes since yesterday")
     } else {

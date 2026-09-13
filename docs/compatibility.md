@@ -14,4 +14,4 @@ Run this checklist in Ghostty, iTerm2, WezTerm, Kitty, Alacritty, a standard Lin
 - [ ] Cached data is marked read-only and does not expose Edit
 - [ ] `q` and Ctrl+C restore raw mode, alternate screen, paste mode, mouse capture, and cursor
 
-Automated baseline: `cargo test --all-targets`.
+Automated baseline: `cargo test --locked --all-targets`.

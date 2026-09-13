@@ -167,7 +167,11 @@ pub fn attention_sorted(
     items
 }
 
-pub fn workload_by_assignee(issues: &[Issue]) -> Vec<Workload> {
+pub fn workload_by_assignee(
+    issues: &[Issue],
+    done_statuses: &[String],
+    in_progress_statuses: &[String],
+) -> Vec<Workload> {
     let mut map: HashMap<String, Workload> = HashMap::new();
     for iss in issues {
         let key = iss
@@ -190,14 +194,9 @@ pub fn workload_by_assignee(issues: &[Issue]) -> Vec<Workload> {
         if crate::domain::filter::is_overdue(iss) {
             e.overdue += 1;
         }
-        // Heuristic: status contains "progress" => doing else todo/done
-        if iss.status.to_lowercase().contains("progress")
-            || iss.status.to_lowercase().contains("doing")
-        {
+        if in_progress_statuses.contains(&iss.status) {
             e.doing += 1;
-        } else if iss.status.to_lowercase().contains("done")
-            || iss.status.to_lowercase().contains("closed")
-        {
+        } else if done_statuses.contains(&iss.status) {
         } else {
             e.todo += 1;
         }
@@ -273,12 +272,15 @@ mod tests {
     #[test]
     fn workload_grouping() {
         let issues = vec![
-            issue_with("To Do", None, false, Some("Alice"), None),
-            issue_with("In Progress", None, false, Some("Alice"), None),
-            issue_with("To Do", None, false, None, None),
+            issue_with("Offen", None, false, Some("Alice"), None),
+            issue_with("In Bearbeitung", None, false, Some("Alice"), None),
+            issue_with("Fertig", None, false, None, None),
         ];
-        let w = workload_by_assignee(&issues);
+        let w = workload_by_assignee(&issues, &["Fertig".into()], &["In Bearbeitung".into()]);
         assert_eq!(w.len(), 2);
-        assert!(w.iter().any(|x| x.assignee == "Alice" && x.total == 2));
+        assert!(w
+            .iter()
+            .any(|x| { x.assignee == "Alice" && x.total == 2 && x.todo == 1 && x.doing == 1 }));
+        assert!(w.iter().any(|x| x.assignee == "(Unassigned)" && x.todo == 0));
     }
 }

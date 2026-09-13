@@ -1,22 +1,25 @@
 use crate::domain::{filter::BuiltInFilter, Board, Issue};
-use crate::infrastructure::config::{Config, JiraAuth, JiraConfig, CONFIG_VERSION};
+use crate::infrastructure::config::{
+    normalize_jira_base_url, Config, JiraAuth, JiraConfig, CONFIG_VERSION,
+};
 use crate::jira::{Choice, TransitionOption, UpdateCommand};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppAction {
     None,
     Quit,
     Refresh,
-    OpenIssue,
+    OpenIssue(String),
     OpenSetup,
     SwitchBoard(usize),
     LoadActivity,
-    LoadTransitions,
+    LoadTransitions { issue_key: String, request_id: u64 },
     LoadAssignees(String),
     LoadPriorities,
-    Update(UpdateCommand),
+    Update { issue_key: String, command: UpdateCommand },
     TestSetupConnection,
     AddSetupBoard(i64),
     SaveSetup,
@@ -47,9 +50,9 @@ pub enum Modal {
     #[default]
     None,
     Detail,
-    EditMenu,
     TransitionPicker,
     AssigneePicker,
+    DueDatePicker,
     DueDateEditor,
     PriorityPicker,
     BoardPicker,
@@ -94,11 +97,19 @@ pub struct AppState {
     pub request_generation: u64,
     pub dashboard_selected: usize,
     pub wbs_selected: usize,
+    pub wbs_roots: Vec<crate::domain::wbs::WbsNode>,
+    pub wbs_visible_keys: Vec<String>,
+    pub wbs_cache_signature: Option<u64>,
     pub activity_selected: usize,
     pub terminal_width: u16,
     pub terminal_height: u16,
     pub activities: Vec<crate::domain::activity::Activity>,
+    pub activity_request_id: u64,
+    pub activity_loading: bool,
     pub updating_key: Option<String>,
+    pub detail_issue_key: Option<String>,
+    pub editing_issue_key: Option<String>,
+    pub edit_request_id: u64,
 }
 
 impl AppState {
@@ -226,7 +237,7 @@ impl AppState {
                 .get(self.dashboard_selected)
                 .and_then(|item| self.issues.iter().find(|issue| issue.key == item.issue.key)),
             View::Wbs => self
-                .visible_wbs_keys()
+                .wbs_visible_keys
                 .get(self.wbs_selected)
                 .and_then(|key| self.issues.iter().find(|issue| &issue.key == key)),
             View::Activity => self
@@ -235,6 +246,11 @@ impl AppState {
                 .and_then(|activity| self.issues.iter().find(|issue| issue.key == activity.key)),
             View::Setup => None,
         }
+    }
+
+    pub fn detail_issue(&self) -> Option<&Issue> {
+        let key = self.detail_issue_key.as_deref()?;
+        self.issues.iter().find(|issue| issue.key == key)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> AppAction {
@@ -259,8 +275,12 @@ impl AppState {
                 return AppAction::LoadActivity;
             }
             KeyCode::Char('?') => self.modal = Modal::Help,
+            KeyCode::Char('s') if self.network == NetworkState::AuthError => {
+                return AppAction::OpenSetup
+            }
+            KeyCode::Char('r') if self.view == View::Activity => return AppAction::LoadActivity,
             KeyCode::Char('r') => return AppAction::Refresh,
-            KeyCode::Char('b') if self.board_refs.len() > 1 => {
+            KeyCode::Char('b') if self.board_refs.len() > 1 && self.updating_key.is_none() => {
                 self.picker_index = self.board_ref_index;
                 self.modal = Modal::BoardPicker;
             }
@@ -279,12 +299,16 @@ impl AppState {
                     .unwrap_or(0);
                 self.modal = Modal::Filter;
             }
-            KeyCode::Enter if self.selected_issue().is_some() => self.modal = Modal::Detail,
-            KeyCode::Char('e') if self.selected_issue().is_some() && !self.offline => {
-                self.edit_index = 0;
-                self.modal = Modal::EditMenu;
+            KeyCode::Enter | KeyCode::Char('e') => {
+                if let Some(issue_key) = self.selected_issue().map(|issue| issue.key.clone()) {
+                    self.open_issue_detail(issue_key);
+                }
             }
-            KeyCode::Char('o') if self.selected_issue().is_some() => return AppAction::OpenIssue,
+            KeyCode::Char('o') => {
+                if let Some(issue_key) = self.selected_issue().map(|issue| issue.key.clone()) {
+                    return AppAction::OpenIssue(issue_key);
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::Char('h') | KeyCode::Left => self.move_horizontal(-1),
@@ -308,13 +332,21 @@ impl AppState {
             }
             View::Wbs => {
                 self.wbs_selected =
-                    move_index(self.wbs_selected, self.visible_wbs_keys().len(), delta)
+                    move_index(self.wbs_selected, self.wbs_visible_keys.len(), delta)
             }
             View::Activity => {
                 self.activity_selected =
                     move_index(self.activity_selected, self.activities.len(), delta)
             }
             View::Setup => {}
+        }
+    }
+
+    fn open_issue_detail(&mut self, issue_key: String) {
+        if self.issues.iter().any(|issue| issue.key == issue_key) {
+            self.detail_issue_key = Some(issue_key);
+            self.edit_index = 0;
+            self.modal = Modal::Detail;
         }
     }
 
@@ -325,27 +357,106 @@ impl AppState {
                 self.ensure_column_rows();
             }
             View::Wbs => {
-                if let Some(key) = self.visible_wbs_keys().get(self.wbs_selected).cloned() {
+                if let Some(key) = self.wbs_visible_keys.get(self.wbs_selected).cloned() {
                     if delta < 0 {
                         self.expanded.remove(&key);
                     } else {
                         self.expanded.insert(key);
                     }
+                    self.rebuild_wbs_visible_keys();
                 }
             }
             _ => {}
         }
     }
 
+    fn invalidate_edit_request(&mut self) {
+        self.edit_request_id = self.edit_request_id.wrapping_add(1);
+        self.status_message = None;
+    }
+
+    fn begin_detail_edit(&mut self) -> AppAction {
+        if self.offline || self.updating_key.is_some() {
+            return AppAction::None;
+        }
+        let Some(issue_key) = self.detail_issue_key.clone() else { return AppAction::None };
+        let due_date = self
+            .detail_issue()
+            .and_then(|issue| issue.due_date)
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+
+        self.invalidate_edit_request();
+        self.editing_issue_key = Some(issue_key.clone());
+        self.error = None;
+        match self.edit_index {
+            0 => {
+                self.transitions.clear();
+                self.picker_index = 0;
+                AppAction::LoadTransitions { issue_key, request_id: self.edit_request_id }
+            }
+            1 => {
+                self.input_buffer.clear();
+                self.choices.clear();
+                self.picker_index = 0;
+                self.modal = Modal::AssigneePicker;
+                AppAction::LoadAssignees(String::new())
+            }
+            2 => {
+                self.input_buffer = due_date;
+                self.picker_index = 0;
+                self.modal = Modal::DueDatePicker;
+                AppAction::None
+            }
+            _ => {
+                self.choices.clear();
+                self.picker_index = 0;
+                self.modal = Modal::PriorityPicker;
+                AppAction::LoadPriorities
+            }
+        }
+    }
+
+    fn finish_edit(&mut self, command: UpdateCommand) -> AppAction {
+        let Some(issue_key) = self.editing_issue_key.take() else {
+            self.modal = Modal::None;
+            return AppAction::None;
+        };
+        self.invalidate_edit_request();
+        self.modal = if self.detail_issue_key.is_some() { Modal::Detail } else { Modal::None };
+        AppAction::Update { issue_key, command }
+    }
+
     fn handle_modal_key(&mut self, key: KeyEvent) -> AppAction {
         if key.code == KeyCode::Esc {
-            if self.modal == Modal::Search {
+            let closing = self.modal;
+            if closing == Modal::Search {
                 self.search_query = None;
                 self.apply_filters();
             }
-            self.modal = Modal::None;
+            if closing == Modal::DueDateEditor && self.detail_issue_key.is_some() {
+                self.modal = Modal::DueDatePicker;
+                self.error = None;
+                return AppAction::None;
+            }
+            let return_to_detail = self.detail_issue_key.is_some()
+                && matches!(
+                    closing,
+                    Modal::TransitionPicker
+                        | Modal::AssigneePicker
+                        | Modal::DueDatePicker
+                        | Modal::DueDateEditor
+                        | Modal::PriorityPicker
+                        | Modal::Error
+                );
+            self.modal = if return_to_detail { Modal::Detail } else { Modal::None };
+            if !return_to_detail {
+                self.detail_issue_key = None;
+            }
             self.error = None;
             self.input_buffer.clear();
+            self.editing_issue_key = None;
+            self.invalidate_edit_request();
             return AppAction::None;
         }
         match self.modal {
@@ -396,40 +507,22 @@ impl AppState {
                 _ => {}
             },
             Modal::Detail => match key.code {
-                KeyCode::Char('e') if !self.offline => {
-                    self.edit_index = 0;
-                    self.modal = Modal::EditMenu;
-                }
-                KeyCode::Char('o') => return AppAction::OpenIssue,
-                _ => {}
-            },
-            Modal::EditMenu => match key.code {
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.edit_index = move_index(self.edit_index, 4, 1)
+                    self.edit_index = move_index(self.edit_index, 4, 1);
+                    self.editing_issue_key = None;
+                    self.invalidate_edit_request();
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    self.edit_index = move_index(self.edit_index, 4, -1)
+                    self.edit_index = move_index(self.edit_index, 4, -1);
+                    self.editing_issue_key = None;
+                    self.invalidate_edit_request();
                 }
-                KeyCode::Enter => match self.edit_index {
-                    0 => return AppAction::LoadTransitions,
-                    1 => {
-                        self.input_buffer.clear();
-                        self.choices.clear();
-                        self.picker_index = 0;
-                        self.modal = Modal::AssigneePicker;
-                        return AppAction::LoadAssignees(String::new());
+                KeyCode::Enter => return self.begin_detail_edit(),
+                KeyCode::Char('o') => {
+                    if let Some(issue_key) = self.detail_issue_key.clone() {
+                        return AppAction::OpenIssue(issue_key);
                     }
-                    2 => {
-                        self.input_buffer.clear();
-                        self.modal = Modal::DueDateEditor;
-                    }
-                    _ => {
-                        self.choices.clear();
-                        self.picker_index = 0;
-                        self.modal = Modal::PriorityPicker;
-                        return AppAction::LoadPriorities;
-                    }
-                },
+                }
                 _ => {}
             },
             Modal::TransitionPicker => match key.code {
@@ -443,38 +536,73 @@ impl AppState {
                     if let Some(transition) = self.transitions.get(self.picker_index) {
                         let command =
                             UpdateCommand::Transition { transition_id: transition.id.clone() };
-                        self.modal = Modal::None;
-                        return AppAction::Update(command);
+                        return self.finish_edit(command);
                     }
                 }
                 _ => {}
             },
             Modal::AssigneePicker => match key.code {
                 KeyCode::Up => {
-                    self.picker_index = move_index(self.picker_index, self.choices.len(), -1)
+                    let len = self.choices.len() + 1 + usize::from(self.current_user.is_some());
+                    self.picker_index = move_index(self.picker_index, len, -1)
                 }
                 KeyCode::Down => {
-                    self.picker_index = move_index(self.picker_index, self.choices.len(), 1)
+                    let len = self.choices.len() + 1 + usize::from(self.current_user.is_some());
+                    self.picker_index = move_index(self.picker_index, len, 1)
                 }
                 KeyCode::Backspace => {
                     self.input_buffer.pop();
                     return AppAction::LoadAssignees(self.input_buffer.clone());
                 }
                 KeyCode::Delete => {
-                    self.modal = Modal::None;
-                    return AppAction::Update(UpdateCommand::Assignee { account_id: None });
+                    return self.finish_edit(UpdateCommand::Assignee { account_id: None });
                 }
                 KeyCode::Enter => {
-                    if let Some(choice) = self.choices.get(self.picker_index) {
+                    if self.picker_index == 0 {
+                        if let Some(account_id) = self.current_user.clone() {
+                            return self.finish_edit(UpdateCommand::Assignee {
+                                account_id: Some(account_id),
+                            });
+                        }
+                        return self.finish_edit(UpdateCommand::Assignee { account_id: None });
+                    }
+                    let unassign_index = usize::from(self.current_user.is_some());
+                    if self.picker_index == unassign_index {
+                        return self.finish_edit(UpdateCommand::Assignee { account_id: None });
+                    }
+                    let choice_index = self.picker_index - unassign_index - 1;
+                    if let Some(choice) = self.choices.get(choice_index) {
                         let command =
                             UpdateCommand::Assignee { account_id: Some(choice.id.clone()) };
-                        self.modal = Modal::None;
-                        return AppAction::Update(command);
+                        return self.finish_edit(command);
                     }
                 }
                 KeyCode::Char(c) => {
                     self.input_buffer.push(c);
                     return AppAction::LoadAssignees(self.input_buffer.clone());
+                }
+                _ => {}
+            },
+            Modal::DueDatePicker => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.picker_index = move_index(self.picker_index, 5, 1)
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.picker_index = move_index(self.picker_index, 5, -1)
+                }
+                KeyCode::Enter => {
+                    let today = chrono::Local::now().date_naive();
+                    let value = match self.picker_index {
+                        0 => Some(today),
+                        1 => Some(today + chrono::Duration::days(1)),
+                        2 => Some(today + chrono::Duration::days(7)),
+                        3 => None,
+                        _ => {
+                            self.modal = Modal::DueDateEditor;
+                            return AppAction::None;
+                        }
+                    };
+                    return self.finish_edit(UpdateCommand::DueDate { value });
                 }
                 _ => {}
             },
@@ -488,8 +616,7 @@ impl AppState {
                 KeyCode::Enter => {
                     if let Some(choice) = self.choices.get(self.picker_index) {
                         let command = UpdateCommand::Priority { id: choice.id.clone() };
-                        self.modal = Modal::None;
-                        return AppAction::Update(command);
+                        return self.finish_edit(command);
                     }
                 }
                 _ => {}
@@ -511,19 +638,25 @@ impl AppState {
                             }
                         }
                     };
-                    self.modal = Modal::None;
-                    return AppAction::Update(UpdateCommand::DueDate { value });
+                    return self.finish_edit(UpdateCommand::DueDate { value });
                 }
                 _ => {}
             },
             Modal::Error => match key.code {
                 KeyCode::Char('r') if self.retry_action.is_some() => {
                     self.modal = Modal::None;
+                    self.detail_issue_key = None;
                     self.error = None;
                     return self.retry_action.clone().unwrap_or(AppAction::None);
                 }
-                KeyCode::Char('o') if self.selected_issue().is_some() => {
-                    return AppAction::OpenIssue
+                KeyCode::Char('o') => {
+                    if let Some(issue_key) = self
+                        .detail_issue_key
+                        .clone()
+                        .or_else(|| self.selected_issue().map(|issue| issue.key.clone()))
+                    {
+                        return AppAction::OpenIssue(issue_key);
+                    }
                 }
                 KeyCode::Char('s') if self.network == NetworkState::AuthError => {
                     self.modal = Modal::None;
@@ -550,14 +683,33 @@ impl AppState {
             return AppAction::None;
         }
         match key.code {
+            KeyCode::Esc if self.setup.step == SetupStep::Boards => {
+                self.setup.step = SetupStep::Connection;
+                self.setup.field = SetupField::Token;
+                self.setup.message = None;
+            }
             KeyCode::Esc => self.setup.confirm_quit = true,
             KeyCode::Tab => self.setup.move_field(1),
             KeyCode::BackTab => self.setup.move_field(-1),
+            KeyCode::Up if self.setup.step == SetupStep::Boards => {
+                self.setup.board_index =
+                    move_index(self.setup.board_index, self.setup.matching_boards().len(), -1);
+            }
+            KeyCode::Down if self.setup.step == SetupStep::Boards => {
+                self.setup.board_index =
+                    move_index(self.setup.board_index, self.setup.matching_boards().len(), 1);
+            }
+            KeyCode::Up => self.setup.move_field(-1),
+            KeyCode::Down => self.setup.move_field(1),
             KeyCode::Left | KeyCode::Right if self.setup.field == SetupField::Auth => {
+                self.setup.auth_explicit = true;
                 self.setup.auth = match self.setup.auth {
                     JiraAuth::CloudBasicApiToken => JiraAuth::DataCenterBearerPat,
                     JiraAuth::DataCenterBearerPat => JiraAuth::CloudBasicApiToken,
                 };
+            }
+            KeyCode::Left | KeyCode::Right if self.setup.field == SetupField::AllowInsecureHttp => {
+                self.setup.allow_insecure_http = !self.setup.allow_insecure_http;
             }
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.setup.show_token = !self.setup.show_token
@@ -572,29 +724,36 @@ impl AppState {
                     return AppAction::SaveSetup;
                 }
             }
-            KeyCode::Enter if self.setup.step == SetupStep::Connection => {
-                return AppAction::TestSetupConnection
-            }
-            KeyCode::Enter if self.setup.step == SetupStep::Boards => {
-                match self.setup.board_input.parse::<i64>() {
-                    Ok(id) if id > 0 => return AppAction::AddSetupBoard(id),
-                    _ => self.setup.message = Some("Board ID must be a positive number".into()),
-                }
+            KeyCode::Enter => return self.activate_setup_primary(),
+            KeyCode::Char(' ') if self.setup.step == SetupStep::Boards => {
+                self.setup.toggle_current_board();
             }
             KeyCode::Delete if self.setup.step == SetupStep::Boards => {
                 self.setup.boards.pop();
             }
             KeyCode::Backspace => {
+                let url_field = self.setup.field == SetupField::Url;
                 if let Some(value) = self.setup.current_value_mut() {
                     value.pop();
+                }
+                if url_field {
+                    self.setup.detect_auth_from_url();
+                }
+                if self.setup.step == SetupStep::Boards {
+                    self.setup.board_index = 0;
                 }
             }
             KeyCode::Char(c) => {
                 let board_field = self.setup.field == SetupField::BoardId;
+                let url_field = self.setup.field == SetupField::Url;
                 if let Some(value) = self.setup.current_value_mut() {
-                    if !board_field || c.is_ascii_digit() {
-                        value.push(c);
-                    }
+                    value.push(c);
+                }
+                if url_field {
+                    self.setup.detect_auth_from_url();
+                }
+                if board_field {
+                    self.setup.board_index = 0;
                 }
             }
             _ => {}
@@ -602,17 +761,43 @@ impl AppState {
         AppAction::None
     }
 
+    fn activate_setup_primary(&mut self) -> AppAction {
+        use crate::ui::setup::SetupStep;
+        if self.setup.step == SetupStep::Connection {
+            return AppAction::TestSetupConnection;
+        }
+        if self.setup.available_boards.is_empty()
+            && self.setup.board_input.is_empty()
+            && !self.setup.boards.is_empty()
+        {
+            return AppAction::SaveSetup;
+        }
+        if !self.setup.matching_boards().is_empty() {
+            if self.setup.boards.is_empty() {
+                self.setup.toggle_current_board();
+            }
+            return AppAction::SaveSetup;
+        }
+        match self.setup.board_input.parse::<i64>() {
+            Ok(id) if id > 0 => AppAction::AddSetupBoard(id),
+            _ => {
+                self.setup.message = Some("No matching Board; enter a positive Board ID".into());
+                AppAction::None
+            }
+        }
+    }
+
     pub fn handle_paste(&mut self, value: &str) -> AppAction {
         if self.view == View::Setup {
-            let board_field = self.setup.field == crate::ui::setup::SetupField::BoardId;
+            let url_field = self.setup.field == crate::ui::setup::SetupField::Url;
             if let Some(target) = self.setup.current_value_mut() {
-                if board_field {
-                    target.extend(value.chars().filter(char::is_ascii_digit));
-                } else {
-                    target.extend(
-                        value.chars().filter(|character| !matches!(character, '\r' | '\n')),
-                    );
-                }
+                target.extend(value.chars().filter(|character| !matches!(character, '\r' | '\n')));
+            }
+            if url_field {
+                self.setup.detect_auth_from_url();
+            }
+            if self.setup.field == crate::ui::setup::SetupField::BoardId {
+                self.setup.board_index = 0;
             }
             return AppAction::None;
         }
@@ -634,68 +819,136 @@ impl AppState {
 
     pub fn handle_mouse(&mut self, event: MouseEvent) -> AppAction {
         use crossterm::event::{MouseButton, MouseEventKind};
-        match event.kind {
-            MouseEventKind::Down(MouseButton::Left) if event.row <= 1 => {
-                let tab_width = (self.terminal_width / 4).max(1);
-                self.view = match usize::from(event.column / tab_width).min(3) {
-                    0 => View::Board,
-                    1 => View::Dashboard,
-                    2 => View::Wbs,
-                    _ => View::Activity,
-                };
-                if self.view == View::Activity {
-                    AppAction::LoadActivity
-                } else {
-                    AppAction::None
-                }
+        if self.modal != Modal::None {
+            return self.handle_modal_mouse(event);
+        }
+        if self.view == View::Setup {
+            if self.terminal_width < 80 || self.terminal_height < 24 {
+                return AppAction::None;
             }
-            MouseEventKind::Down(MouseButton::Left) if self.modal == Modal::None => {
+            match event.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let area =
+                        ratatui::layout::Rect::new(0, 0, self.terminal_width, self.terminal_height);
+                    match crate::ui::setup::hit_test(area, &self.setup, event.column, event.row) {
+                        Some(crate::ui::setup::SetupHit::Field(field)) => {
+                            self.setup.field = field;
+                            match field {
+                                crate::ui::setup::SetupField::Auth => {
+                                    self.setup.auth_explicit = true;
+                                    self.setup.auth = match self.setup.auth {
+                                        JiraAuth::CloudBasicApiToken => {
+                                            JiraAuth::DataCenterBearerPat
+                                        }
+                                        JiraAuth::DataCenterBearerPat => {
+                                            JiraAuth::CloudBasicApiToken
+                                        }
+                                    };
+                                }
+                                crate::ui::setup::SetupField::AllowInsecureHttp => {
+                                    self.setup.allow_insecure_http =
+                                        !self.setup.allow_insecure_http;
+                                }
+                                _ => {}
+                            }
+                        }
+                        Some(crate::ui::setup::SetupHit::Board(index)) => {
+                            self.setup.board_index = index;
+                            self.setup.toggle_current_board();
+                        }
+                        Some(crate::ui::setup::SetupHit::PrimaryAction) => {
+                            return self.activate_setup_primary();
+                        }
+                        None => {}
+                    }
+                }
+                MouseEventKind::ScrollDown
+                    if self.setup.step == crate::ui::setup::SetupStep::Boards =>
+                {
+                    self.setup.board_index =
+                        move_index(self.setup.board_index, self.setup.matching_boards().len(), 1);
+                }
+                MouseEventKind::ScrollUp
+                    if self.setup.step == crate::ui::setup::SetupStep::Boards =>
+                {
+                    self.setup.board_index =
+                        move_index(self.setup.board_index, self.setup.matching_boards().len(), -1);
+                }
+                _ => {}
+            }
+            return AppAction::None;
+        }
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let area =
+                    ratatui::layout::Rect::new(0, 0, self.terminal_width, self.terminal_height);
+                let sections = crate::ui::layout::AppSections::new(area);
+                if let Some(view) =
+                    crate::ui::header_hit_test(sections.header, event.column, event.row)
+                {
+                    self.view = view;
+                    return if view == View::Activity {
+                        AppAction::LoadActivity
+                    } else {
+                        AppAction::None
+                    };
+                }
                 match self.view {
                     View::Board => {
-                        let count = self.column_count();
-                        let visible = usize::from((self.terminal_width / 24).max(1)).min(count);
-                        let start = if self.selected_col >= self.col_scroll + visible {
-                            self.selected_col + 1 - visible
-                        } else {
-                            self.col_scroll.min(count.saturating_sub(visible))
-                        };
-                        let width = (self.terminal_width / visible.max(1) as u16).max(1);
-                        let column = start + usize::from(event.column / width);
-                        if column < count {
+                        if let Some((column, row)) = crate::ui::board::hit_test(
+                            sections.content,
+                            self,
+                            event.column,
+                            event.row,
+                        ) {
                             self.selected_col = column;
-                            let visible_rows =
-                                usize::from(self.terminal_height.saturating_sub(5)) / 4;
-                            let selected = *self.column_rows.get(column).unwrap_or(&0);
-                            let offset = selected.saturating_sub(visible_rows.saturating_sub(1));
-                            let row = offset + usize::from(event.row.saturating_sub(3)) / 4;
-                            let len = self.column_issue_indices(column).len();
-                            if len > 0 {
-                                self.column_rows[column] = row.min(len - 1);
+                            self.column_rows[column] = row;
+                            if let Some(issue_key) =
+                                self.selected_issue().map(|issue| issue.key.clone())
+                            {
+                                self.open_issue_detail(issue_key);
                             }
                         }
                     }
                     View::Dashboard => {
-                        let row = usize::from(event.row.saturating_sub(9));
-                        let visible = usize::from(self.terminal_height.saturating_sub(15));
-                        let offset =
-                            self.dashboard_selected.saturating_sub(visible.saturating_sub(1));
-                        self.dashboard_selected =
-                            (offset + row).min(self.attention_items().len().saturating_sub(1));
+                        let attention = self.attention_items();
+                        if let Some(index) = crate::ui::dashboard::hit_test(
+                            sections.content,
+                            attention.len(),
+                            self.dashboard_selected,
+                            event.column,
+                            event.row,
+                        ) {
+                            let issue_key = attention[index].issue.key.clone();
+                            self.dashboard_selected = index;
+                            self.open_issue_detail(issue_key);
+                        }
                     }
                     View::Wbs => {
-                        let row = usize::from(event.row.saturating_sub(3));
-                        let visible = usize::from(self.terminal_height.saturating_sub(5));
-                        let offset = self.wbs_selected.saturating_sub(visible.saturating_sub(1));
-                        self.wbs_selected =
-                            (offset + row).min(self.visible_wbs_keys().len().saturating_sub(1));
+                        if let Some(index) = crate::ui::wbs::hit_test(
+                            sections.content,
+                            self.wbs_visible_keys.len(),
+                            self.wbs_selected,
+                            event.column,
+                            event.row,
+                        ) {
+                            let issue_key = self.wbs_visible_keys[index].clone();
+                            self.wbs_selected = index;
+                            self.open_issue_detail(issue_key);
+                        }
                     }
                     View::Activity => {
-                        let row = usize::from(event.row.saturating_sub(3));
-                        let visible = usize::from(self.terminal_height.saturating_sub(5));
-                        let offset =
-                            self.activity_selected.saturating_sub(visible.saturating_sub(1));
-                        self.activity_selected =
-                            (offset + row).min(self.activities.len().saturating_sub(1));
+                        if let Some(index) = crate::ui::activity::hit_test(
+                            sections.content,
+                            self.activities.len(),
+                            self.activity_selected,
+                            event.column,
+                            event.row,
+                        ) {
+                            let issue_key = self.activities[index].key.clone();
+                            self.activity_selected = index;
+                            self.open_issue_detail(issue_key);
+                        }
                     }
                     View::Setup => {}
                 }
@@ -713,9 +966,43 @@ impl AppState {
         }
     }
 
+    fn handle_modal_mouse(&mut self, event: MouseEvent) -> AppAction {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        match event.kind {
+            MouseEventKind::ScrollDown => self.handle_modal_key(key(KeyCode::Down)),
+            MouseEventKind::ScrollUp => self.handle_modal_key(key(KeyCode::Up)),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let area =
+                    ratatui::layout::Rect::new(0, 0, self.terminal_width, self.terminal_height);
+                match crate::ui::modal_hit_test(area, self, event.column, event.row) {
+                    Some(crate::ui::ModalHit::DetailField(index)) => {
+                        self.edit_index = index;
+                        self.editing_issue_key = None;
+                        self.invalidate_edit_request();
+                        self.begin_detail_edit()
+                    }
+                    Some(crate::ui::ModalHit::ListItem(index)) => {
+                        if self.modal == Modal::Filter {
+                            self.filter_index = index;
+                        } else {
+                            self.picker_index = index;
+                        }
+                        self.handle_modal_key(key(KeyCode::Enter))
+                    }
+                    Some(crate::ui::ModalHit::Outside) => self.handle_modal_key(key(KeyCode::Esc)),
+                    None => AppAction::None,
+                }
+            }
+            _ => AppAction::None,
+        }
+    }
+
     pub fn setup_jira_config(&self, board_ids: Vec<i64>) -> Result<JiraConfig, String> {
+        let url = normalize_jira_base_url(&self.setup.url).map_err(|error| error.to_string())?;
         let jira = JiraConfig {
-            url: self.setup.url.trim().trim_end_matches('/').to_string(),
+            allow_insecure_http: self.setup.allow_insecure_http && url.starts_with("http://"),
+            url,
             auth: self.setup.auth.clone(),
             username: (self.setup.auth == JiraAuth::CloudBasicApiToken)
                 .then(|| self.setup.username.trim().to_string()),
@@ -751,11 +1038,38 @@ impl AppState {
             .map(|(index, _)| index)
             .collect();
         self.rebuild_column_cache();
+        self.rebuild_wbs_cache();
         self.column_rows.fill(0);
         self.ensure_column_rows();
     }
 
-    pub fn visible_wbs_keys(&self) -> Vec<String> {
+    fn rebuild_wbs_cache(&mut self) {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for issue in &self.issues {
+            issue.key.hash(&mut hasher);
+            issue.summary.hash(&mut hasher);
+            issue.status.hash(&mut hasher);
+            issue.parent_key.hash(&mut hasher);
+            issue.epic_key.hash(&mut hasher);
+        }
+        let done = self
+            .board
+            .as_ref()
+            .and_then(|board| board.columns.last())
+            .map(|column| column.statuses.clone())
+            .unwrap_or_default();
+        done.hash(&mut hasher);
+        let signature = hasher.finish();
+        if self.wbs_cache_signature == Some(signature) {
+            return;
+        }
+        self.wbs_cache_signature = Some(signature);
+        self.wbs_roots = crate::domain::wbs::build_wbs(&self.issues, &done);
+        self.rebuild_wbs_visible_keys();
+        self.wbs_selected = self.wbs_selected.min(self.wbs_visible_keys.len().saturating_sub(1));
+    }
+
+    fn rebuild_wbs_visible_keys(&mut self) {
         fn visit(
             output: &mut Vec<String>,
             nodes: &[crate::domain::wbs::WbsNode],
@@ -768,16 +1082,9 @@ impl AppState {
                 }
             }
         }
-        let done = self
-            .board
-            .as_ref()
-            .and_then(|board| board.columns.last())
-            .map(|column| column.statuses.clone())
-            .unwrap_or_default();
-        let roots = crate::domain::wbs::build_wbs(&self.issues, &done);
         let mut keys = Vec::new();
-        visit(&mut keys, &roots, &self.expanded);
-        keys
+        visit(&mut keys, &self.wbs_roots, &self.expanded);
+        self.wbs_visible_keys = keys;
     }
 }
 
@@ -854,6 +1161,78 @@ mod tests {
     }
 
     #[test]
+    fn setup_detects_jira_type_from_url_until_user_overrides_it() {
+        let mut cloud = AppState { view: View::Setup, ..Default::default() };
+        cloud.setup.field = crate::ui::setup::SetupField::Url;
+        cloud.handle_paste("https://team.atlassian.net/jira/software/c/projects/P/boards/1");
+        assert_eq!(cloud.setup.auth, JiraAuth::CloudBasicApiToken);
+
+        let mut data_center = AppState { view: View::Setup, ..Default::default() };
+        data_center.setup.field = crate::ui::setup::SetupField::Url;
+        data_center.handle_paste("https://jira.internal.test/jira");
+        assert_eq!(data_center.setup.auth, JiraAuth::DataCenterBearerPat);
+
+        data_center.setup.field = crate::ui::setup::SetupField::Auth;
+        data_center.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(data_center.setup.auth_explicit);
+        assert_eq!(data_center.setup.auth, JiraAuth::CloudBasicApiToken);
+        data_center.setup.field = crate::ui::setup::SetupField::Url;
+        data_center.setup.url.clear();
+        data_center.handle_paste("https://another.internal.test");
+        assert_eq!(data_center.setup.auth, JiraAuth::CloudBasicApiToken);
+    }
+
+    #[test]
+    fn setup_uses_arrows_for_fields_and_enter_to_save_verified_boards() {
+        let mut state = AppState { view: View::Setup, ..Default::default() };
+        assert_eq!(state.setup.field, crate::ui::setup::SetupField::Auth);
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.setup.field, crate::ui::setup::SetupField::Url);
+
+        state.setup.step = crate::ui::setup::SetupStep::Boards;
+        state.setup.field = crate::ui::setup::SetupField::BoardId;
+        state.setup.boards.push(crate::ui::setup::SetupBoard { id: 42, name: "Board".into() });
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::SaveSetup
+        );
+    }
+
+    #[test]
+    fn setup_selects_discovered_board_by_name_without_numeric_id() {
+        let mut state = AppState { view: View::Setup, ..Default::default() };
+        state.setup.step = crate::ui::setup::SetupStep::Boards;
+        state.setup.field = crate::ui::setup::SetupField::BoardId;
+        state.setup.available_boards = vec![
+            crate::ui::setup::SetupBoard { id: 1, name: "Alpha".into() },
+            crate::ui::setup::SetupBoard { id: 2, name: "Beta".into() },
+        ];
+
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(action, AppAction::SaveSetup);
+        assert_eq!(
+            state.setup.boards,
+            vec![crate::ui::setup::SetupBoard { id: 2, name: "Beta".into() }]
+        );
+    }
+
+    #[test]
+    fn escape_from_board_setup_returns_to_connection_without_discarding_boards() {
+        let mut state = AppState { view: View::Setup, ..Default::default() };
+        state.setup.step = crate::ui::setup::SetupStep::Boards;
+        state.setup.field = crate::ui::setup::SetupField::BoardId;
+        state.setup.boards.push(crate::ui::setup::SetupBoard { id: 42, name: "Board".into() });
+
+        state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(state.setup.step, crate::ui::setup::SetupStep::Connection);
+        assert!(!state.setup.confirm_quit);
+        assert_eq!(state.setup.boards.len(), 1);
+    }
+
+    #[test]
     fn data_center_setup_omits_username() {
         let mut state = AppState::default();
         state.setup.auth = JiraAuth::DataCenterBearerPat;
@@ -861,6 +1240,17 @@ mod tests {
         state.setup.username = "must-not-be-saved".into();
         let config = state.setup_jira_config(vec![42]).unwrap();
         assert_eq!(config.username, None);
+    }
+
+    #[test]
+    fn setup_requires_explicit_confirmation_for_insecure_http() {
+        let mut state = AppState::default();
+        state.setup.auth = JiraAuth::DataCenterBearerPat;
+        state.setup.url = "http://jira.internal.test".into();
+
+        assert!(state.setup_jira_config(vec![42]).is_err());
+        state.setup.allow_insecure_http = true;
+        assert!(state.setup_jira_config(vec![42]).is_ok());
     }
 
     #[test]
@@ -891,7 +1281,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_menu_stages_status_before_any_update() {
+    fn issue_detail_stages_status_before_any_update() {
         let mut state = AppState {
             view: View::Board,
             board: Some(board()),
@@ -903,11 +1293,422 @@ mod tests {
             state.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
             AppAction::None
         );
-        assert_eq!(state.modal, Modal::EditMenu);
+        assert_eq!(state.modal, Modal::Detail);
+        assert_eq!(state.detail_issue_key.as_deref(), Some("P-1"));
+        let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            action,
+            AppAction::LoadTransitions { issue_key, .. } if issue_key == "P-1"
+        ));
+    }
+
+    #[test]
+    fn issue_detail_keeps_original_issue_when_background_selection_changes() {
+        let mut state = AppState {
+            view: View::Board,
+            board: Some(board()),
+            issues: vec![issue("P-1", "To Do"), issue("P-2", "To Do")],
+            ..Default::default()
+        };
+        state.apply_filters();
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        state.column_rows[0] = 1;
+
+        assert_eq!(state.selected_issue().map(|issue| issue.key.as_str()), Some("P-2"));
+        assert_eq!(state.detail_issue().map(|issue| issue.key.as_str()), Some("P-1"));
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
+            AppAction::OpenIssue("P-1".into())
+        );
+    }
+
+    #[test]
+    fn due_date_picker_offers_custom_editor_with_existing_value() {
+        let mut dated = issue("P-1", "To Do");
+        dated.due_date = chrono::NaiveDate::from_ymd_opt(2026, 9, 30);
+        let mut state = AppState {
+            view: View::Board,
+            board: Some(board()),
+            issues: vec![dated],
+            ..Default::default()
+        };
+        state.apply_filters();
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
         assert_eq!(
             state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            AppAction::LoadTransitions
+            AppAction::None
         );
+        assert_eq!(state.modal, Modal::DueDatePicker);
+        for _ in 0..4 {
+            state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(state.modal, Modal::DueDateEditor);
+        assert_eq!(state.input_buffer, "2026-09-30");
+    }
+
+    #[test]
+    fn assignee_picker_puts_assign_to_me_before_search_results() {
+        let mut state = AppState {
+            view: View::Board,
+            board: Some(board()),
+            issues: vec![issue("P-1", "To Do")],
+            current_user: Some("account-42".into()),
+            ..Default::default()
+        };
+        state.apply_filters();
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::LoadAssignees(String::new())
+        );
+
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::Update {
+                issue_key: "P-1".into(),
+                command: UpdateCommand::Assignee { account_id: Some("account-42".into()) }
+            }
+        );
+        assert_eq!(state.modal, Modal::Detail);
+    }
+
+    #[test]
+    fn assignee_picker_can_unassign_without_searching() {
+        let mut state = AppState {
+            view: View::Board,
+            board: Some(board()),
+            issues: vec![issue("P-1", "To Do")],
+            current_user: Some("account-42".into()),
+            ..Default::default()
+        };
+        state.apply_filters();
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::Update {
+                issue_key: "P-1".into(),
+                command: UpdateCommand::Assignee { account_id: None }
+            }
+        );
+    }
+
+    #[test]
+    fn due_date_picker_can_clear_date_without_text_input() {
+        let mut state = AppState {
+            view: View::Board,
+            board: Some(board()),
+            issues: vec![issue("P-1", "To Do")],
+            ..Default::default()
+        };
+        state.apply_filters();
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for _ in 0..3 {
+            state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::Update {
+                issue_key: "P-1".into(),
+                command: UpdateCommand::DueDate { value: None }
+            }
+        );
+    }
+
+    #[test]
+    fn mouse_can_clear_due_date_directly_from_issue_detail() {
+        let mut state = AppState {
+            view: View::Board,
+            board: Some(board()),
+            issues: vec![issue("P-1", "To Do")],
+            terminal_width: 100,
+            terminal_height: 30,
+            ..Default::default()
+        };
+        state.apply_filters();
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let click = |column, row| crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(state.handle_mouse(click(12, 11)), AppAction::None);
+        assert_eq!(state.modal, Modal::DueDatePicker);
+        assert_eq!(
+            state.handle_mouse(click(20, 15)),
+            AppAction::Update {
+                issue_key: "P-1".into(),
+                command: UpdateCommand::DueDate { value: None }
+            }
+        );
+        assert_eq!(state.modal, Modal::Detail);
+    }
+
+    #[test]
+    fn clicking_outside_issue_detail_closes_it() {
+        let mut state = AppState {
+            view: View::Board,
+            board: Some(board()),
+            issues: vec![issue("P-1", "To Do")],
+            terminal_width: 100,
+            terminal_height: 30,
+            ..Default::default()
+        };
+        state.apply_filters();
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        state.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(state.modal, Modal::None);
+        assert_eq!(state.detail_issue_key, None);
+    }
+
+    #[test]
+    fn clicking_board_card_opens_its_issue_detail() {
+        let mut state = AppState {
+            view: View::Board,
+            board: Some(board()),
+            issues: vec![issue("P-1", "To Do")],
+            terminal_width: 100,
+            terminal_height: 30,
+            ..Default::default()
+        };
+        state.apply_filters();
+
+        state.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(state.modal, Modal::Detail);
+        assert_eq!(state.detail_issue_key.as_deref(), Some("P-1"));
+    }
+
+    #[test]
+    fn rendered_header_regions_switch_views() {
+        let mut state = AppState {
+            view: View::Board,
+            terminal_width: 100,
+            terminal_height: 30,
+            ..Default::default()
+        };
+        let click = |column, row| crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        state.handle_mouse(click(10, 1));
+        assert_eq!(state.view, View::Dashboard);
+        state.view = View::Board;
+        state.handle_mouse(click(80, 1));
+        assert_eq!(state.view, View::Board);
+    }
+
+    #[test]
+    fn rendered_list_regions_open_details_in_every_list_view() {
+        let click = |column, row| crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let state = || AppState {
+            board: Some(board()),
+            issues: vec![issue("P-1", "To Do")],
+            terminal_width: 100,
+            terminal_height: 30,
+            ..Default::default()
+        };
+
+        let mut dashboard = state();
+        dashboard.view = View::Dashboard;
+        dashboard.apply_filters();
+        dashboard.handle_mouse(click(2, 9));
+        assert_eq!(dashboard.detail_issue_key.as_deref(), Some("P-1"));
+
+        let mut wbs = state();
+        wbs.view = View::Wbs;
+        wbs.apply_filters();
+        wbs.handle_mouse(click(2, 3));
+        assert_eq!(wbs.detail_issue_key.as_deref(), Some("P-1"));
+
+        let mut activity = state();
+        activity.view = View::Activity;
+        activity.activities = vec![crate::domain::activity::Activity {
+            key: "P-1".into(),
+            summary: "summary".into(),
+            kind: crate::domain::activity::ChangeKind::Status,
+            from: Some("To Do".into()),
+            to: Some("Done".into()),
+            at: chrono::Utc::now(),
+        }];
+        activity.apply_filters();
+        activity.handle_mouse(click(2, 3));
+        assert_eq!(activity.detail_issue_key.as_deref(), Some("P-1"));
+    }
+
+    #[test]
+    fn edit_action_keeps_original_issue_key_during_mouse_input() {
+        let mut state = AppState {
+            view: View::Board,
+            board: Some(board()),
+            issues: vec![issue("P-1", "To Do"), issue("P-2", "To Do")],
+            ..Default::default()
+        };
+        state.apply_filters();
+        state.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+
+        let mouse_action = state.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 1,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(mouse_action, AppAction::None);
+        assert_eq!(state.selected_issue().map(|issue| issue.key.as_str()), Some("P-1"));
+
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for _ in 0..4 {
+            state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        state.input_buffer = "2026-09-30".into();
+        let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            action,
+            AppAction::Update {
+                issue_key,
+                command: UpdateCommand::DueDate { .. }
+            } if issue_key == "P-1"
+        ));
+    }
+
+    #[test]
+    fn escaping_edit_invalidates_pending_transition_request() {
+        let mut state = AppState {
+            view: View::Board,
+            board: Some(board()),
+            issues: vec![issue("P-1", "To Do")],
+            ..Default::default()
+        };
+        state.apply_filters();
+        state.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let AppAction::LoadTransitions { request_id, .. } = action else {
+            panic!("expected transition request");
+        };
+
+        state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(state.editing_issue_key, None);
+        assert_ne!(state.edit_request_id, request_id);
+    }
+
+    #[test]
+    fn activity_refresh_requests_activity_data() {
+        let mut state = AppState { view: View::Activity, ..Default::default() };
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            AppAction::LoadActivity
+        );
+    }
+
+    #[test]
+    fn authentication_error_can_open_setup_after_error_modal_is_closed() {
+        let mut state = AppState {
+            view: View::Board,
+            network: NetworkState::AuthError,
+            offline: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            AppAction::OpenSetup
+        );
+    }
+
+    #[test]
+    fn setup_ignores_non_semantic_mouse_regions() {
+        let mut state = AppState { view: View::Setup, ..Default::default() };
+        let action = state.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(action, AppAction::None);
+        assert_eq!(state.view, View::Setup);
+    }
+
+    #[test]
+    fn setup_mouse_focuses_fields_and_runs_primary_action() {
+        let mut state = AppState {
+            view: View::Setup,
+            terminal_width: 80,
+            terminal_height: 24,
+            ..Default::default()
+        };
+        let click = |column, row| crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        state.handle_mouse(click(5, 4));
+        assert_eq!(state.setup.field, crate::ui::setup::SetupField::Auth);
+        assert_eq!(state.setup.auth, JiraAuth::DataCenterBearerPat);
+        state.handle_mouse(click(5, 7));
+        assert_eq!(state.setup.field, crate::ui::setup::SetupField::Url);
+        assert_eq!(state.handle_mouse(click(5, 21)), AppAction::TestSetupConnection);
+    }
+
+    #[test]
+    fn setup_mouse_selects_and_saves_a_discovered_board() {
+        let mut state = AppState {
+            view: View::Setup,
+            terminal_width: 80,
+            terminal_height: 24,
+            ..Default::default()
+        };
+        state.setup.step = crate::ui::setup::SetupStep::Boards;
+        state.setup.field = crate::ui::setup::SetupField::BoardId;
+        state.setup.available_boards =
+            vec![crate::ui::setup::SetupBoard { id: 42, name: "Team Board".into() }];
+        let click = |column, row| crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(state.handle_mouse(click(5, 7)), AppAction::None);
+        assert_eq!(state.setup.boards[0].id, 42);
+        assert_eq!(state.handle_mouse(click(5, 21)), AppAction::SaveSetup);
     }
 
     #[test]

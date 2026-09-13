@@ -19,7 +19,7 @@ pub use state::AppState;
 use state::{AppAction, Modal, NetworkState, View};
 
 type SetupBoardResults = Vec<(i64, Result<Board, String>)>;
-type SetupConnectionResult = Result<(Choice, SetupBoardResults), String>;
+type SetupConnectionResult = Result<(Choice, Vec<Choice>, SetupBoardResults), String>;
 
 struct TerminalSession;
 impl TerminalSession {
@@ -49,16 +49,36 @@ impl Drop for TerminalSession {
 }
 
 enum RuntimeResult {
-    Loaded { generation: u64, result: Result<(Board, Vec<Issue>), crate::jira::JiraError> },
-    Updated { key: String, result: Result<Issue, crate::jira::JiraError> },
-    Transitions(Result<Vec<TransitionOption>, crate::jira::JiraError>),
+    Loaded {
+        generation: u64,
+        result: Result<(Board, Vec<Issue>), crate::jira::JiraError>,
+    },
+    Updated {
+        key: String,
+        result: Result<Issue, crate::jira::JiraError>,
+    },
+    Transitions {
+        issue_key: String,
+        request_id: u64,
+        result: Result<Vec<TransitionOption>, crate::jira::JiraError>,
+    },
     Choices(Result<Vec<Choice>, crate::jira::JiraError>),
-    AssigneeChoices { query: String, result: Result<Vec<Choice>, crate::jira::JiraError> },
-    Activity(Result<Vec<Activity>, crate::jira::JiraError>),
+    AssigneeChoices {
+        query: String,
+        result: Result<Vec<Choice>, crate::jira::JiraError>,
+    },
+    Activity {
+        board_ref: String,
+        request_id: u64,
+        result: Result<Vec<Activity>, crate::jira::JiraError>,
+    },
     Viewer(Result<Choice, crate::jira::JiraError>),
     BoardNames(Vec<(usize, Result<Board, crate::jira::JiraError>)>),
     SetupConnection(SetupConnectionResult),
-    SetupBoard { id: i64, result: Result<Board, String> },
+    SetupBoard {
+        id: i64,
+        result: Result<Board, String>,
+    },
     SetupSaved(Result<(Config, JiraService, Board, Vec<Issue>), String>),
 }
 
@@ -164,7 +184,9 @@ fn initialise_service(config: &Config) -> Result<Arc<JiraService>, String> {
 fn prepare_setup(state: &mut AppState, config: &Config, error: String) {
     state.view = View::Setup;
     state.setup.auth = config.jira.auth.clone();
+    state.setup.auth_explicit = true;
     state.setup.url = config.jira.url.clone();
+    state.setup.allow_insecure_http = config.jira.allow_insecure_http;
     state.setup.username = config.jira.username.clone().unwrap_or_default();
     state.setup.preserved_board_ids = config.jira.board_ids.clone();
     state.setup.preserved_token_env = config.jira.token_env.clone();
@@ -202,6 +224,22 @@ fn schedule_board_names(service: Arc<JiraService>, tx: mpsc::UnboundedSender<Run
     });
 }
 
+fn schedule_activity(
+    state: &mut AppState,
+    service: Arc<JiraService>,
+    tx: mpsc::UnboundedSender<RuntimeResult>,
+) {
+    let Some(board_ref) = state.current_board_ref().map(str::to_owned) else { return };
+    state.activity_request_id = state.activity_request_id.wrapping_add(1);
+    state.activity_loading = true;
+    let request_id = state.activity_request_id;
+    tokio::spawn(async move {
+        let since = chrono::Utc::now() - chrono::Duration::days(1);
+        let result = service.activity(&board_ref, since).await;
+        let _ = tx.send(RuntimeResult::Activity { board_ref, request_id, result });
+    });
+}
+
 fn process_action(
     action: AppAction,
     state: &mut AppState,
@@ -223,9 +261,9 @@ fn process_action(
                 schedule_load(state, active, tx.clone());
             }
         }
-        AppAction::OpenIssue => {
-            if let (Some(active), Some(issue)) = (service.as_ref(), state.selected_issue()) {
-                if let Err(error) = open::that(active.issue_url(&issue.key)) {
+        AppAction::OpenIssue(issue_key) => {
+            if let Some(active) = service.as_ref() {
+                if let Err(error) = open::that(active.issue_url(&issue_key)) {
                     show_error(state, error.to_string(), None);
                 }
             }
@@ -241,6 +279,8 @@ fn process_action(
         }
         AppAction::SwitchBoard(index) => {
             if index < state.board_refs.len() && index != state.board_ref_index {
+                state.activity_request_id = state.activity_request_id.wrapping_add(1);
+                state.activity_loading = false;
                 state.board_ref_index = index;
                 state.board = None;
                 state.issues.clear();
@@ -253,23 +293,19 @@ fn process_action(
                 load_cache(state, config.as_ref());
                 if let Some(active) = service.clone() {
                     state.loading = true;
-                    schedule_load(state, active, tx.clone());
+                    schedule_load(state, active.clone(), tx.clone());
+                    if state.view == View::Activity {
+                        schedule_activity(state, active, tx.clone());
+                    }
                 }
             }
         }
         AppAction::LoadActivity => {
-            if let (Some(active), Some(board_ref)) =
-                (service.clone(), state.current_board_ref().map(str::to_owned))
-            {
-                let sender = tx.clone();
-                tokio::spawn(async move {
-                    let since = chrono::Utc::now() - chrono::Duration::days(1);
-                    let _ = sender
-                        .send(RuntimeResult::Activity(active.activity(&board_ref, since).await));
-                });
+            if let Some(active) = service.clone() {
+                schedule_activity(state, active, tx.clone());
             }
         }
-        AppAction::LoadTransitions => {
+        AppAction::LoadTransitions { issue_key, request_id } => {
             if state.offline {
                 show_error(
                     state,
@@ -278,11 +314,12 @@ fn process_action(
                 );
                 return false;
             }
-            if let (Some(active), Some(issue)) = (service.clone(), state.selected_issue()) {
-                let key = issue.key.clone();
+            if let Some(active) = service.clone() {
                 let sender = tx.clone();
                 tokio::spawn(async move {
-                    let _ = sender.send(RuntimeResult::Transitions(active.transitions(&key).await));
+                    let result = active.transitions(&issue_key).await;
+                    let _ =
+                        sender.send(RuntimeResult::Transitions { issue_key, request_id, result });
                 });
                 state.status_message = Some("Loading Status choices…".into());
             }
@@ -304,7 +341,7 @@ fn process_action(
                 });
             }
         }
-        AppAction::Update(command) => {
+        AppAction::Update { issue_key, command } => {
             if state.offline {
                 show_error(
                     state,
@@ -313,13 +350,19 @@ fn process_action(
                 );
                 return false;
             }
-            let (Some(active), Some(issue)) = (service.clone(), state.selected_issue()) else {
-                return false;
-            };
+            let Some(active) = service.clone() else { return false };
             if state.updating_key.is_some() {
                 return false;
             }
-            let key = issue.key.clone();
+            if !state.issues.iter().any(|issue| issue.key == issue_key) {
+                show_error(
+                    state,
+                    format!("Issue {issue_key} is no longer on the selected Board"),
+                    Some(AppAction::Refresh),
+                );
+                return false;
+            }
+            let key = issue_key;
             let label = command.label();
             state.updating_key = Some(key.clone());
             state.status_message = Some(format!("Updating {label} for {key}…"));
@@ -341,7 +384,11 @@ fn process_action(
                 }
             };
             let secret = state.setup.token.clone();
-            let preserved = state.setup.preserved_board_ids.clone();
+            let preserved = if state.setup.boards.is_empty() {
+                state.setup.preserved_board_ids.clone()
+            } else {
+                state.setup.boards.iter().map(|board| board.id).collect()
+            };
             state.setup.busy = true;
             state.setup.message = None;
             let sender = tx.clone();
@@ -349,7 +396,9 @@ fn process_action(
                 let result = async {
                     let service =
                         JiraService::new(&jira, secret).map_err(|error| error.to_string())?;
-                    let viewer = service.viewer().await.map_err(|error| error.to_string())?;
+                    let (viewer, available_boards) =
+                        tokio::try_join!(service.viewer(), service.available_boards())
+                            .map_err(|error| error.to_string())?;
                     let mut boards = Vec::new();
                     for id in preserved {
                         boards.push((
@@ -360,7 +409,7 @@ fn process_action(
                                 .map_err(|error| error.to_string()),
                         ));
                     }
-                    Ok((viewer, boards))
+                    Ok((viewer, available_boards, boards))
                 }
                 .await;
                 let _ = sender.send(RuntimeResult::SetupConnection(result));
@@ -449,7 +498,7 @@ fn handle_result(
             state.refreshing = false;
             match result {
                 Ok((board, issues)) => {
-                    save_cache(state, config.as_ref(), &board, &issues);
+                    let cache_error = save_cache(state, config.as_ref(), &board, &issues).err();
                     if let Some(name) = state.board_names.get_mut(state.board_ref_index) {
                         *name = board.name.clone();
                     }
@@ -460,9 +509,17 @@ fn handle_result(
                     state.error = None;
                     state.retry_action = None;
                     state.apply_filters();
-                    state.status_message = Some("Board is up to date".into());
+                    state.status_message = Some(match cache_error {
+                        Some(error) => {
+                            format!("Board is up to date · cache was not saved: {error}")
+                        }
+                        None => "Board is up to date".into(),
+                    });
                 }
-                Err(error) if state.board.is_some() => {
+                Err(error)
+                    if state.board.is_some()
+                        && !matches!(&error, crate::jira::JiraError::Authentication(_)) =>
+                {
                     state.offline = true;
                     state.network = network_state_for_error(&error);
                     state.status_message = Some(format!("Read-only cache · {error}"));
@@ -478,23 +535,40 @@ fn handle_result(
                         *slot = issue;
                     }
                     state.apply_filters();
-                    state.status_message = Some(format!("Updated {key}"));
+                    let cache_error = state.board.as_ref().and_then(|board| {
+                        save_cache(state, config.as_ref(), board, &state.issues).err()
+                    });
+                    state.status_message = Some(match cache_error {
+                        Some(error) => format!("Updated {key} · cache was not saved: {error}"),
+                        None => format!("Updated {key}"),
+                    });
                 }
                 Err(error) => show_jira_error(state, error, None),
             }
         }
-        RuntimeResult::Transitions(result) => match result {
-            Ok(transitions) if transitions.is_empty() => {
-                show_error(state, "No Status transitions are available for this Issue".into(), None)
+        RuntimeResult::Transitions { issue_key, request_id, result } => {
+            if request_id != state.edit_request_id
+                || state.editing_issue_key.as_deref() != Some(issue_key.as_str())
+                || state.modal != Modal::Detail
+                || state.edit_index != 0
+            {
+                return None;
             }
-            Ok(transitions) => {
-                state.transitions = transitions;
-                state.picker_index = 0;
-                state.modal = Modal::TransitionPicker;
-                state.status_message = None;
+            match result {
+                Ok(transitions) if transitions.is_empty() => show_error(
+                    state,
+                    "No Status transitions are available for this Issue".into(),
+                    None,
+                ),
+                Ok(transitions) => {
+                    state.transitions = transitions;
+                    state.picker_index = 0;
+                    state.modal = Modal::TransitionPicker;
+                    state.status_message = None;
+                }
+                Err(error) => show_jira_error(state, error, None),
             }
-            Err(error) => show_jira_error(state, error, None),
-        },
+        }
         RuntimeResult::Choices(result) => match result {
             Ok(choices) => {
                 state.choices = choices;
@@ -514,13 +588,21 @@ fn handle_result(
                 Err(error) => show_jira_error(state, error, None),
             }
         }
-        RuntimeResult::Activity(result) => match result {
-            Ok(items) => {
-                state.activities = items;
-                state.activity_selected = 0;
+        RuntimeResult::Activity { board_ref, request_id, result } => {
+            if request_id != state.activity_request_id
+                || state.current_board_ref() != Some(board_ref.as_str())
+            {
+                return None;
             }
-            Err(error) => show_jira_error(state, error, Some(AppAction::LoadActivity)),
-        },
+            state.activity_loading = false;
+            match result {
+                Ok(items) => {
+                    state.activities = items;
+                    state.activity_selected = 0;
+                }
+                Err(error) => show_jira_error(state, error, Some(AppAction::LoadActivity)),
+            }
+        }
         RuntimeResult::Viewer(result) => match result {
             Ok(viewer) => {
                 state.current_user = Some(viewer.id);
@@ -550,17 +632,36 @@ fn handle_result(
         RuntimeResult::SetupConnection(result) => {
             state.setup.busy = false;
             match result {
-                Ok((viewer, preserved)) => {
+                Ok((viewer, available, preserved)) => {
                     state.setup.step = crate::ui::setup::SetupStep::Boards;
                     state.setup.field = crate::ui::setup::SetupField::BoardId;
                     state.setup.boards.clear();
+                    state.setup.available_boards = available
+                        .into_iter()
+                        .filter_map(|board| {
+                            Some(crate::ui::setup::SetupBoard {
+                                id: board.id.parse().ok()?,
+                                name: board.label,
+                            })
+                        })
+                        .collect();
+                    state.setup.board_index = 0;
+                    state.setup.board_input.clear();
                     let mut failed = Vec::new();
                     for (id, result) in preserved {
                         match result {
-                            Ok(board) => state
-                                .setup
-                                .boards
-                                .push(crate::ui::setup::SetupBoard { id, name: board.name }),
+                            Ok(board) => {
+                                let board = crate::ui::setup::SetupBoard { id, name: board.name };
+                                state.setup.boards.push(board.clone());
+                                if !state
+                                    .setup
+                                    .available_boards
+                                    .iter()
+                                    .any(|available| available.id == id)
+                                {
+                                    state.setup.available_boards.push(board);
+                                }
+                            }
                             Err(error) => failed.push(format!("{id}: {error}")),
                         }
                     }
@@ -582,7 +683,11 @@ fn handle_result(
             state.setup.busy = false;
             match result {
                 Ok(board) => {
-                    state.setup.boards.push(crate::ui::setup::SetupBoard { id, name: board.name });
+                    let board = crate::ui::setup::SetupBoard { id, name: board.name };
+                    state.setup.boards.push(board.clone());
+                    if !state.setup.available_boards.iter().any(|available| available.id == id) {
+                        state.setup.available_boards.push(board);
+                    }
                     state.setup.board_input.clear();
                     state.setup.message = Some(format!("Board {id} verified"));
                 }
@@ -671,12 +776,243 @@ fn load_cache(state: &mut AppState, config: Option<&Config>) {
     }
 }
 
-fn save_cache(state: &AppState, config: Option<&Config>, board: &Board, issues: &[Issue]) {
-    let Some(board_ref) = state.current_board_ref() else { return };
-    let _ = crate::infrastructure::cache::CacheData::save(
-        &cache_identity(config),
-        board_ref,
-        board,
-        issues,
-    );
+fn save_cache(
+    state: &AppState,
+    config: Option<&Config>,
+    board: &Board,
+    issues: &[Issue],
+) -> anyhow::Result<()> {
+    let Some(board_ref) = state.current_board_ref() else { return Ok(()) };
+    crate::infrastructure::cache::CacheData::save(&cache_identity(config), board_ref, board, issues)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::BoardColumn;
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+    use wiremock::{
+        matchers::{header, method, path, query_param},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    fn board() -> Board {
+        Board {
+            id: 1,
+            name: "Board".into(),
+            columns: vec![BoardColumn { name: "To Do".into(), statuses: vec!["To Do".into()] }],
+        }
+    }
+
+    fn empty_runtime_dependencies() -> (Option<Arc<JiraService>>, Option<Config>) {
+        (None, None)
+    }
+
+    async fn run_setup_connection(state: &mut AppState) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut service, mut config) = empty_runtime_dependencies();
+        let temp = tempfile::tempdir().unwrap();
+        assert!(!process_action(
+            AppAction::TestSetupConnection,
+            state,
+            &mut service,
+            &mut config,
+            &temp.path().join("config.toml"),
+            &tx,
+        ));
+        assert!(state.setup.busy);
+        let result = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("Setup request timed out")
+            .expect("Setup request task closed without a result");
+        handle_result(result, state, &mut service, &mut config);
+    }
+
+    fn setup_state(url: String, auth: crate::infrastructure::config::JiraAuth) -> AppState {
+        let mut state = AppState { view: View::Setup, ..Default::default() };
+        state.setup.url = url;
+        state.setup.allow_insecure_http = true;
+        state.setup.auth = auth;
+        state.setup.auth_explicit = true;
+        state.setup.username = "alice@example.com".into();
+        state.setup.token = "new-token".into();
+        state
+    }
+
+    async fn mount_board_discovery(server: &MockServer, authorization: &str) {
+        Mock::given(method("GET"))
+            .and(path("/rest/agile/1.0/board"))
+            .and(query_param("startAt", "0"))
+            .and(query_param("maxResults", "50"))
+            .and(header("authorization", authorization))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "startAt": 0,
+                "maxResults": 50,
+                "total": 1,
+                "isLast": true,
+                "values": [{"id": 42, "name": "Team Board", "type": "kanban"}]
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn cloud_setup_authenticates_and_discovers_boards() {
+        let server = MockServer::start().await;
+        let authorization = format!("Basic {}", BASE64.encode("alice@example.com:new-token"));
+        Mock::given(method("GET"))
+            .and(path("/rest/api/2/myself"))
+            .and(header("authorization", authorization.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accountId": "cloud-account",
+                "displayName": "Alice Cloud"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_board_discovery(&server, &authorization).await;
+        let mut state =
+            setup_state(server.uri(), crate::infrastructure::config::JiraAuth::CloudBasicApiToken);
+
+        run_setup_connection(&mut state).await;
+
+        assert_eq!(state.setup.step, crate::ui::setup::SetupStep::Boards);
+        assert_eq!(state.setup.available_boards.len(), 1);
+        assert_eq!(state.setup.available_boards[0].name, "Team Board");
+        assert_eq!(state.setup.message.as_deref(), Some("Authenticated as Alice Cloud"));
+    }
+
+    #[tokio::test]
+    async fn data_center_auth_recovery_revalidates_existing_board() {
+        let server = MockServer::start().await;
+        let authorization = "Bearer new-token";
+        Mock::given(method("GET"))
+            .and(path("/rest/api/2/myself"))
+            .and(header("authorization", authorization))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "alice",
+                "displayName": "Alice Data Center"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_board_discovery(&server, authorization).await;
+        Mock::given(method("GET"))
+            .and(path("/rest/agile/1.0/board/42"))
+            .and(header("authorization", authorization))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 42,
+                "name": "Team Board",
+                "type": "kanban"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/agile/1.0/board/42/configuration"))
+            .and(header("authorization", authorization))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "columnConfig": {
+                    "constraintType": "none",
+                    "columns": [{
+                        "name": "Offen",
+                        "statuses": [{"id": "1", "name": "Offen"}]
+                    }]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state =
+            setup_state(server.uri(), crate::infrastructure::config::JiraAuth::DataCenterBearerPat);
+        state.network = NetworkState::AuthError;
+        state.offline = true;
+        state.setup.preserved_board_ids = vec![42];
+
+        run_setup_connection(&mut state).await;
+
+        assert_eq!(state.setup.step, crate::ui::setup::SetupStep::Boards);
+        assert_eq!(state.setup.boards.len(), 1);
+        assert_eq!(state.setup.boards[0].id, 42);
+        assert!(state.setup.preserved_board_ids.is_empty());
+        assert_eq!(state.setup.message.as_deref(), Some("Authenticated as Alice Data Center"));
+    }
+
+    #[test]
+    fn stale_transition_response_does_not_reopen_editor() {
+        let mut state = AppState {
+            modal: Modal::Detail,
+            edit_index: 0,
+            detail_issue_key: Some("P-1".into()),
+            editing_issue_key: Some("P-1".into()),
+            edit_request_id: 7,
+            ..Default::default()
+        };
+        let (mut service, mut config) = empty_runtime_dependencies();
+
+        handle_result(
+            RuntimeResult::Transitions {
+                issue_key: "P-1".into(),
+                request_id: 6,
+                result: Ok(vec![TransitionOption {
+                    id: "31".into(),
+                    name: "Start".into(),
+                    target_status: "In Progress".into(),
+                }]),
+            },
+            &mut state,
+            &mut service,
+            &mut config,
+        );
+
+        assert_eq!(state.modal, Modal::Detail);
+        assert!(state.transitions.is_empty());
+    }
+
+    #[test]
+    fn activity_response_for_previous_board_is_ignored() {
+        let mut state = AppState {
+            board_refs: vec!["1".into(), "2".into()],
+            board_ref_index: 1,
+            activity_request_id: 4,
+            activity_loading: true,
+            ..Default::default()
+        };
+        let (mut service, mut config) = empty_runtime_dependencies();
+
+        handle_result(
+            RuntimeResult::Activity {
+                board_ref: "1".into(),
+                request_id: 4,
+                result: Ok(Vec::new()),
+            },
+            &mut state,
+            &mut service,
+            &mut config,
+        );
+
+        assert!(state.activity_loading);
+    }
+
+    #[test]
+    fn cached_authentication_failure_opens_repairable_error() {
+        let mut state =
+            AppState { board: Some(board()), request_generation: 3, ..Default::default() };
+        let (mut service, mut config) = empty_runtime_dependencies();
+
+        handle_result(
+            RuntimeResult::Loaded {
+                generation: 3,
+                result: Err(crate::jira::JiraError::Authentication("expired".into())),
+            },
+            &mut state,
+            &mut service,
+            &mut config,
+        );
+
+        assert_eq!(state.modal, Modal::Error);
+        assert_eq!(state.network, NetworkState::AuthError);
+        assert!(state.offline);
+    }
 }

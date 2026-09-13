@@ -1,11 +1,12 @@
 pub mod activity;
 pub mod board;
 pub mod dashboard;
+pub mod layout;
 pub mod setup;
 pub mod wbs;
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -13,9 +14,17 @@ use ratatui::{
 };
 
 use crate::app::state::{AppState, Modal, NetworkState, View};
+use layout::{contains, HitRegion, SelectableListRegion};
 
 const MIN_WIDTH: u16 = 80;
 const MIN_HEIGHT: u16 = 24;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalHit {
+    DetailField(usize),
+    ListItem(usize),
+    Outside,
+}
 
 pub fn render(frame: &mut Frame, state: &AppState) {
     if frame.area().width < MIN_WIDTH || frame.area().height < MIN_HEIGHT {
@@ -37,18 +46,14 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         return;
     }
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(10), Constraint::Length(1)])
-        .split(frame.area());
-    render_header(frame, chunks[0], state);
-    render_content(frame, chunks[1], state);
-    render_footer(frame, chunks[2], state);
+    let sections = layout::AppSections::new(frame.area());
+    render_header(frame, sections.header, state);
+    render_content(frame, sections.content, state);
+    render_footer(frame, sections.footer, state);
 
     match state.modal {
         Modal::Help => render_help(frame, state),
         Modal::Detail => render_detail(frame, state),
-        Modal::EditMenu => render_list(frame, "Edit Issue", edit_items(), state.edit_index, 7),
         Modal::TransitionPicker => render_list(
             frame,
             "Select Status · Enter confirms",
@@ -62,11 +67,14 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         ),
         Modal::AssigneePicker => render_list(
             frame,
-            &format!("Assignee · type to search: {} · Delete unassigns", state.input_buffer),
-            state.choices.iter().map(|item| item.label.clone()).collect(),
+            &format!("Assignee · type to search: {}", state.input_buffer),
+            assignee_items(state),
             state.picker_index,
             16,
         ),
+        Modal::DueDatePicker => {
+            render_list(frame, "Due date", due_date_items(), state.picker_index, 9)
+        }
         Modal::PriorityPicker => render_list(
             frame,
             "Priority · Enter confirms",
@@ -115,8 +123,76 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     }
 }
 
+pub fn modal_hit_test(area: Rect, state: &AppState, column: u16, row: u16) -> Option<ModalHit> {
+    let list = modal_list_spec(state);
+    let modal_area = if let Some((item_count, _, max_height)) = list {
+        list_area(item_count, max_height, area)
+    } else {
+        match state.modal {
+            Modal::Detail => centered(82, 18, area),
+            Modal::DueDateEditor | Modal::Search => centered(72, 6, area),
+            Modal::Error => centered(74, 9, area),
+            Modal::Help => centered(76, 17, area),
+            Modal::None => return None,
+            _ => return None,
+        }
+    };
+    if !contains(modal_area, column, row) {
+        return Some(ModalHit::Outside);
+    }
+    if state.modal == Modal::Detail {
+        let first_field_row = modal_area.y.saturating_add(3);
+        if column > modal_area.x
+            && column < modal_area.x.saturating_add(modal_area.width).saturating_sub(1)
+            && row >= first_field_row
+            && row < first_field_row.saturating_add(4)
+        {
+            return Some(ModalHit::DetailField(usize::from(row - first_field_row)));
+        }
+    }
+    if let Some((item_count, selected, _)) = list {
+        if let Some(index) = list_region(modal_area, item_count, selected).hit(column, row) {
+            return Some(ModalHit::ListItem(index));
+        }
+    }
+    None
+}
+
+fn modal_list_spec(state: &AppState) -> Option<(usize, usize, u16)> {
+    match state.modal {
+        Modal::TransitionPicker => Some((state.transitions.len(), state.picker_index, 14)),
+        Modal::AssigneePicker => Some((assignee_items(state).len(), state.picker_index, 16)),
+        Modal::DueDatePicker => Some((5, state.picker_index, 9)),
+        Modal::PriorityPicker => Some((state.choices.len(), state.picker_index, 14)),
+        Modal::BoardPicker => Some((state.board_refs.len(), state.picker_index, 16)),
+        Modal::Filter => Some((4, state.filter_index, 9)),
+        _ => None,
+    }
+}
+
+fn assignee_items(state: &AppState) -> Vec<String> {
+    let mut items = Vec::new();
+    if state.current_user.is_some() {
+        items.push("Assign to me".into());
+    }
+    items.push("Unassign".into());
+    items.extend(state.choices.iter().map(|item| item.label.clone()));
+    items
+}
+
+fn due_date_items() -> Vec<String> {
+    let today = chrono::Local::now().date_naive();
+    vec![
+        format!("Today · {today}"),
+        format!("Tomorrow · {}", today + chrono::Duration::days(1)),
+        format!("One week from today · {}", today + chrono::Duration::days(7)),
+        "Clear due date".into(),
+        "Enter a date…".into(),
+    ]
+}
+
 fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
-    let labels = ["1 Board", "2 Dashboard", "3 WBS", "4 Activity"];
+    let labels = header_labels();
     let active = match state.view {
         View::Board => 0,
         View::Dashboard => 1,
@@ -141,13 +217,45 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
     let board_name =
         state.board_names.get(state.board_ref_index).map(String::as_str).unwrap_or("Loading Board");
     frame.render_widget(
-        Paragraph::new(Line::from(tabs)).block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .title(format!(" jira-kanban-tui · {board_name} ")),
-        ),
-        area,
+        Paragraph::new(format!(" jira-kanban-tui · {board_name}"))
+            .style(Style::default().fg(Color::White).bg(Color::DarkGray)),
+        Rect::new(area.x, area.y, area.width, 1.min(area.height)),
     );
+    frame.render_widget(
+        Paragraph::new(Line::from(tabs)),
+        Rect::new(area.x, area.y.saturating_add(1), area.width, area.height.saturating_sub(1)),
+    );
+}
+
+pub fn header_hit_test(area: Rect, column: u16, row: u16) -> Option<View> {
+    let views = [View::Board, View::Dashboard, View::Wbs, View::Activity];
+    let mut x = area.x;
+    let tab_row =
+        Rect::new(area.x, area.y.saturating_add(1), area.width, area.height.saturating_sub(1));
+    for (label, view) in header_labels().into_iter().zip(views) {
+        let width = label.len() as u16 + 2;
+        let region = HitRegion {
+            area: Rect::new(
+                x,
+                tab_row.y,
+                width.min(tab_row.x.saturating_add(tab_row.width).saturating_sub(x)),
+                tab_row.height,
+            ),
+            target: view,
+        };
+        if let Some(view) = region.hit(column, row) {
+            return Some(view);
+        }
+        x = x.saturating_add(width);
+        if x >= area.x.saturating_add(area.width) {
+            break;
+        }
+    }
+    None
+}
+
+fn header_labels() -> [&'static str; 4] {
+    ["1 Board", "2 Dashboard", "3 WBS", "4 Activity"]
 }
 
 fn render_content(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -176,7 +284,8 @@ fn render_content(frame: &mut Frame, area: Rect, state: &AppState) {
                 .unwrap_or_default();
             let stats = crate::domain::dashboard::compute_stats(&state.issues, &done, &progress);
             let attention = state.attention_items();
-            let workload = crate::domain::dashboard::workload_by_assignee(&state.issues);
+            let workload =
+                crate::domain::dashboard::workload_by_assignee(&state.issues, &done, &progress);
             dashboard::render_dashboard(
                 frame,
                 area,
@@ -187,14 +296,7 @@ fn render_content(frame: &mut Frame, area: Rect, state: &AppState) {
             );
         }
         View::Wbs => {
-            let done = state
-                .board
-                .as_ref()
-                .and_then(|board| board.columns.last())
-                .map(|column| column.statuses.clone())
-                .unwrap_or_default();
-            let roots = crate::domain::wbs::build_wbs(&state.issues, &done);
-            wbs::render_wbs(frame, area, &roots, &state.expanded, state.wbs_selected);
+            wbs::render_wbs(frame, area, &state.wbs_roots, &state.expanded, state.wbs_selected);
         }
         View::Activity => {
             activity::render_activity(frame, area, &state.activities, state.activity_selected)
@@ -206,6 +308,8 @@ fn render_content(frame: &mut Frame, area: Rect, state: &AppState) {
 fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
     let status = if state.loading {
         "Loading Board…".into()
+    } else if state.view == View::Activity && state.activity_loading {
+        "Loading Activity…".into()
     } else if state.refreshing {
         "Refreshing…".into()
     } else {
@@ -224,7 +328,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
                     format!("RATE LIMITED · READ-ONLY · {message} · r retry")
                 }
                 NetworkState::AuthError => {
-                    format!("AUTHENTICATION ERROR · READ-ONLY · {message} · run doctor")
+                    format!("AUTHENTICATION ERROR · READ-ONLY · {message} · s repair connection")
                 }
                 _ => format!("READ-ONLY · {message} · r retry"),
             }
@@ -242,7 +346,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
 fn render_detail(frame: &mut Frame, state: &AppState) {
     let area = centered(82, 18, frame.area());
     frame.render_widget(Clear, area);
-    let Some(issue) = state.selected_issue() else { return };
+    let Some(issue) = state.detail_issue() else { return };
     let assignee =
         issue.assignee.as_ref().map(|value| value.display_name.as_str()).unwrap_or("Unassigned");
     let priority = issue.priority.as_ref().map(|value| value.name.as_str()).unwrap_or("—");
@@ -264,32 +368,42 @@ fn render_detail(frame: &mut Frame, state: &AppState) {
         }
     }
     let dependencies = if dependencies.is_empty() { "—".into() } else { dependencies.join(", ") };
-    let text = format!(
-        "{}\n\nStatus       {}\nAssignee     {}\nPriority     {}\nDue          {}\nParent       {}\nDependencies {}\nUpdated      {}\n\n{}",
-        issue.summary,
-        issue.status,
-        assignee,
-        priority,
-        due,
-        issue.parent_key.as_deref().or(issue.epic_key.as_deref()).unwrap_or("—"),
-        dependencies,
-        updated,
-        if state.offline {
+    let field = |index: usize, label: &str, value: &str| {
+        let selected = !state.offline && state.edit_index == index;
+        let line = Line::raw(format!("{} {label:<11} {value}", if selected { "▶" } else { " " }));
+        if selected {
+            line.style(Style::default().fg(Color::Yellow).bg(Color::DarkGray))
+        } else {
+            line
+        }
+    };
+    let lines = vec![
+        Line::raw(issue.summary.clone()),
+        Line::raw(""),
+        field(0, "Status", &issue.status),
+        field(1, "Assignee", assignee),
+        field(2, "Due", &due),
+        field(3, "Priority", priority),
+        Line::raw(format!(
+            "  {:<11} {}",
+            "Parent",
+            issue.parent_key.as_deref().or(issue.epic_key.as_deref()).unwrap_or("—")
+        )),
+        Line::raw(format!("  {:<11} {dependencies}", "Dependencies")),
+        Line::raw(format!("  {:<11} {updated}", "Updated")),
+        Line::raw(""),
+        Line::raw(if state.offline {
             "Read-only cache · o open Jira · Esc close"
         } else {
-            "e edit · o open Jira · Esc close"
-        }
-    );
+            "↑/↓ select · Enter edit · o open Jira · Esc close"
+        }),
+    ];
     frame.render_widget(
-        Paragraph::new(text)
+        Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL).title(format!(" {} ", issue.key))),
         area,
     );
-}
-
-fn edit_items() -> Vec<String> {
-    vec!["Status".into(), "Assignee".into(), "Due date".into(), "Priority".into()]
 }
 
 fn render_list(
@@ -299,11 +413,9 @@ fn render_list(
     selected: usize,
     max_height: u16,
 ) {
-    let height = (items.len() as u16 + 2).clamp(5, max_height);
-    let area = centered(66, height, frame.area());
+    let area = list_area(items.len(), max_height, frame.area());
     frame.render_widget(Clear, area);
-    let visible = usize::from(area.height.saturating_sub(2));
-    let scroll = selected.saturating_sub(visible.saturating_sub(1));
+    let scroll = list_region(area, items.len(), selected).scroll();
     let lines = if items.is_empty() {
         vec![Line::styled("No choices", Style::default().fg(Color::DarkGray))]
     } else {
@@ -329,6 +441,15 @@ fn render_list(
     );
 }
 
+fn list_area(item_count: usize, max_height: u16, area: Rect) -> Rect {
+    let height = (item_count as u16 + 2).clamp(5, max_height);
+    centered(66, height, area)
+}
+
+fn list_region(area: Rect, item_count: usize, selected: usize) -> SelectableListRegion {
+    SelectableListRegion { area, item_count, selected, row_height: 1 }
+}
+
 fn render_input(frame: &mut Frame, title: &str, value: &str, error: Option<&str>) {
     let area = centered(72, 6, frame.area());
     frame.render_widget(Clear, area);
@@ -350,7 +471,7 @@ fn render_error(frame: &mut Frame, state: &AppState) {
     if state.retry_action.is_some() {
         actions.insert(0, "r retry");
     }
-    if state.selected_issue().is_some() {
+    if state.detail_issue().or_else(|| state.selected_issue()).is_some() {
         actions.insert(0, "o open Jira");
     }
     if state.network == NetworkState::AuthError {
@@ -383,11 +504,8 @@ fn render_help(frame: &mut Frame, state: &AppState) {
         View::Setup => "",
     };
     let board_help = if state.board_refs.len() > 1 { "  b             select Board\n" } else { "" };
-    let edit_help = if state.offline {
-        ""
-    } else {
-        "  e             edit Status / Assignee / Due date / Priority\n"
-    };
+    let edit_help =
+        if state.offline { "" } else { "  e             open editable Issue details\n" };
     let text = format!(
         "Global\n  1/2/3/4       Board / Dashboard / WBS / Activity\n{board_help}  r             refresh\n  ?             help\n  q / Ctrl+C    quit\n\n{context}\n\nIssue\n  Enter         details\n{edit_help}  o             open Jira\n\nEsc closes any dialog"
     );
