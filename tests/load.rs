@@ -1,6 +1,6 @@
 #![allow(clippy::field_reassign_with_default)]
 
-use jira_kanban_tui::app::state::AppState;
+use jira_kanban_tui::app::state::{AppState, View};
 use jira_kanban_tui::domain::{Board, BoardColumn, Issue, IssueType};
 use std::time::Duration;
 
@@ -66,6 +66,21 @@ fn large_board_navigation_and_filter() {
     state.apply_filters();
     assert!(start.elapsed().as_millis() < 50);
     assert!(!state.filtered_issues.is_empty());
+
+    // WBS navigation uses the hierarchy cache built when Issue data changes.
+    state.search_query = None;
+    state.apply_filters();
+    state.view = View::Wbs;
+    let start = std::time::Instant::now();
+    for _ in 0..500 {
+        state.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+    let elapsed = start.elapsed();
+    assert!(elapsed < NAVIGATION_BUDGET, "WBS navigation too slow: {elapsed:?}");
+    assert_eq!(state.wbs_selected, 499);
 
     // refresh flag
     state.refreshing = true;
