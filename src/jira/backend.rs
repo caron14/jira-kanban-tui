@@ -76,6 +76,16 @@ impl JiraService {
         Ok(crate::domain::mapping::map_board(board, config))
     }
 
+    pub async fn available_boards(&self) -> Result<Vec<Choice>, JiraError> {
+        Ok(self
+            .client
+            .get_boards()
+            .await?
+            .into_iter()
+            .map(|board| Choice { id: board.id.to_string(), label: board.name })
+            .collect())
+    }
+
     pub async fn load_board(&self, board_ref: &str) -> Result<Board, JiraError> {
         let mapped = self.inspect_board(board_ref).await?;
         let blocked = mapped
@@ -179,7 +189,12 @@ impl JiraService {
         board_ref: &str,
         since: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<Activity>, JiraError> {
-        self.client.get_board_activity(parse_board_id(board_ref)?, since).await
+        let board = self.load_board(board_ref).await?;
+        let done = board.columns.last().map(|column| column.statuses.as_slice()).unwrap_or(&[]);
+        let mut activities =
+            self.client.get_board_activity(parse_board_id(board_ref)?, since).await?;
+        mark_completed_activities(&mut activities, done);
+        Ok(activities)
     }
 
     pub async fn assignees(&self, query: &str) -> Result<Vec<Choice>, JiraError> {
@@ -215,4 +230,35 @@ impl JiraService {
 
 fn parse_board_id(value: &str) -> Result<i64, JiraError> {
     value.parse().map_err(|_| JiraError::Validation("invalid Jira Board ID".into()))
+}
+
+fn mark_completed_activities(activities: &mut [Activity], done_statuses: &[String]) {
+    for activity in activities {
+        if activity.kind == crate::domain::activity::ChangeKind::Status
+            && activity.to.as_ref().map(|status| done_statuses.contains(status)).unwrap_or(false)
+        {
+            activity.kind = crate::domain::activity::ChangeKind::Completed;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_uses_board_workflow_instead_of_english_status_names() {
+        let mut activities = vec![Activity {
+            key: "P-1".into(),
+            summary: "Work".into(),
+            kind: crate::domain::activity::ChangeKind::Status,
+            from: Some("In Bearbeitung".into()),
+            to: Some("Fertig".into()),
+            at: chrono::Utc::now(),
+        }];
+
+        mark_completed_activities(&mut activities, &["Fertig".into()]);
+
+        assert_eq!(activities[0].kind, crate::domain::activity::ChangeKind::Completed);
+    }
 }

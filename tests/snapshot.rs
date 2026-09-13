@@ -121,6 +121,28 @@ fn render_help_modal() {
 }
 
 #[test]
+fn issue_detail_renders_directly_editable_fields() {
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = AppState::default();
+    state.view = View::Board;
+    state.board = Some(sample_board());
+    state.issues = sample_issues();
+    state.apply_filters();
+    state.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    terminal.draw(|frame| jira_kanban_tui::ui::render(frame, &state)).unwrap();
+    let content: String =
+        terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect();
+    assert!(content.contains("▶ Status"));
+    assert!(content.contains("Enter edit"));
+    assert!(content.contains("PROJ-1"));
+}
+
+#[test]
 fn render_search_filter_error_modals() {
     for modal in [Modal::Search, Modal::Filter, Modal::Error] {
         let backend = TestBackend::new(80, 24);

@@ -6,6 +6,35 @@ use crate::infrastructure::cli::Cli;
 
 pub const CONFIG_VERSION: u32 = 3;
 
+pub fn normalize_jira_base_url(value: &str) -> Result<String> {
+    let mut parsed = url::Url::parse(value.trim()).context("Jira URL is invalid")?;
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+
+    let host = parsed.host_str().context("Jira URL must include a host name")?;
+    if host.ends_with(".atlassian.net") {
+        parsed.set_path("");
+    } else {
+        let segments = parsed
+            .path_segments()
+            .map(|segments| segments.filter(|segment| !segment.is_empty()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let page_marker = segments.iter().position(|segment| {
+            matches!(*segment, "browse" | "issues" | "projects" | "secure" | "software")
+        });
+        if let Some(index) = page_marker {
+            let base_path = if index == 0 {
+                String::new()
+            } else {
+                format!("/{}", segments[..index].join("/"))
+            };
+            parsed.set_path(&base_path);
+        }
+    }
+
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum JiraAuth {
@@ -16,6 +45,8 @@ pub enum JiraAuth {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JiraConfig {
     pub url: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_insecure_http: bool,
     pub auth: JiraAuth,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
@@ -32,11 +63,29 @@ impl JiraConfig {
     }
 
     pub fn keyring_service(&self) -> String {
-        let host = url::Url::parse(&self.url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_owned))
-            .unwrap_or_else(|| "jira".into());
-        format!("jira-kanban-tui/{host}")
+        let Ok(parsed) = url::Url::parse(&self.url) else {
+            return "jira-kanban-tui/jira".into();
+        };
+        let host = parsed.host_str().unwrap_or("jira");
+        let default_https = parsed.scheme() == "https"
+            && matches!(parsed.port_or_known_default(), Some(443))
+            && matches!(parsed.path(), "" | "/");
+        if default_https {
+            // Preserve the v3 keyring location for the common case.
+            return format!("jira-kanban-tui/{host}");
+        }
+
+        let identity = format!(
+            "{}://{}:{}{}",
+            parsed.scheme(),
+            host,
+            parsed.port_or_known_default().unwrap_or(0),
+            parsed.path().trim_end_matches('/')
+        );
+        let digest = ring::digest::digest(&ring::digest::SHA256, identity.as_bytes());
+        let scope =
+            digest.as_ref().iter().take(12).map(|byte| format!("{byte:02x}")).collect::<String>();
+        format!("jira-kanban-tui/{host}/{scope}")
     }
 
     pub fn keyring_user(&self) -> &str {
@@ -48,11 +97,22 @@ impl JiraConfig {
 
     pub fn validate(&self) -> Result<()> {
         let parsed = url::Url::parse(&self.url).context("Jira URL is invalid")?;
-        if !matches!(parsed.scheme(), "http" | "https")
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-        {
-            anyhow::bail!("Jira URL must be an http(s) URL without embedded credentials");
+        if !matches!(parsed.scheme(), "http" | "https") {
+            anyhow::bail!("Jira URL must use HTTPS");
+        }
+        if parsed.scheme() == "http" && !self.allow_insecure_http {
+            anyhow::bail!(
+                "Jira URL must use HTTPS; explicitly enable insecure HTTP only for a trusted network"
+            );
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            anyhow::bail!("Jira URL must not contain embedded credentials");
+        }
+        if parsed.host_str().is_none() {
+            anyhow::bail!("Jira URL must include a host name");
+        }
+        if parsed.query().is_some() || parsed.fragment().is_some() {
+            anyhow::bail!("Jira URL must not include a query string or fragment");
         }
         if self.auth == JiraAuth::CloudBasicApiToken
             && self.username.as_deref().map(str::trim).unwrap_or_default().is_empty()
@@ -85,6 +145,10 @@ impl JiraConfig {
         jira.board_ids = vec![board_id];
         Ok(jira)
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -194,6 +258,7 @@ fn migrate_v2(path: &Path, content: &str) -> Result<Config> {
     };
     let jira = JiraConfig {
         url,
+        allow_insecure_http: false,
         username: (auth == JiraAuth::CloudBasicApiToken).then_some(username),
         auth,
         board_ids,
@@ -248,6 +313,7 @@ mod tests {
             version: CONFIG_VERSION,
             jira: JiraConfig {
                 url: "https://example.atlassian.net".into(),
+                allow_insecure_http: false,
                 auth: JiraAuth::CloudBasicApiToken,
                 username: Some("alice@example.com".into()),
                 board_ids: vec![42, 99],
@@ -273,6 +339,68 @@ mod tests {
         config.jira.auth = JiraAuth::DataCenterBearerPat;
         config.jira.username = None;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn connection_scope_separates_context_paths_and_ports() {
+        let mut first = config().jira;
+        first.url = "https://jira.example.test/production".into();
+        let mut second = first.clone();
+        second.url = "https://jira.example.test/staging".into();
+        let mut third = first.clone();
+        third.url = "https://jira.example.test:8443/production".into();
+
+        assert_ne!(first.keyring_service(), second.keyring_service());
+        assert_ne!(first.keyring_service(), third.keyring_service());
+        assert_ne!(second.keyring_service(), third.keyring_service());
+    }
+
+    #[test]
+    fn common_https_origin_keeps_v3_keyring_location() {
+        let jira = config().jira;
+        assert_eq!(jira.keyring_service(), "jira-kanban-tui/example.atlassian.net");
+    }
+
+    #[test]
+    fn validation_rejects_endpoint_query_and_fragment() {
+        let mut jira = config().jira;
+        jira.url = "https://jira.example.test/path?redirect=other".into();
+        assert!(jira.validate().is_err());
+
+        jira.url = "https://jira.example.test/path#fragment".into();
+        assert!(jira.validate().is_err());
+    }
+
+    #[test]
+    fn insecure_http_requires_an_explicit_opt_in() {
+        let mut jira = config().jira;
+        jira.url = "http://jira.internal.test".into();
+        assert!(jira.validate().is_err());
+
+        jira.allow_insecure_http = true;
+        assert!(jira.validate().is_ok());
+    }
+
+    #[test]
+    fn normalizes_cloud_page_url_to_site_origin() {
+        assert_eq!(
+            normalize_jira_base_url(
+                "https://example.atlassian.net/jira/software/c/projects/PROJ/boards/42?selectedIssue=P-1"
+            )
+            .unwrap(),
+            "https://example.atlassian.net"
+        );
+    }
+
+    #[test]
+    fn normalizes_data_center_page_url_without_losing_context_path() {
+        assert_eq!(
+            normalize_jira_base_url(
+                "https://jira.example.test/jira/secure/RapidBoard.jspa?rapidView=42"
+            )
+            .unwrap(),
+            "https://jira.example.test/jira"
+        );
     }
 
     #[test]

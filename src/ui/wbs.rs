@@ -7,6 +7,18 @@ use ratatui::{
     Frame,
 };
 
+use super::layout::SelectableListRegion;
+
+pub fn hit_test(
+    area: Rect,
+    item_count: usize,
+    selected: usize,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    SelectableListRegion { area, item_count, selected, row_height: 1 }.hit(column, row)
+}
+
 pub fn render_wbs(
     f: &mut Frame,
     area: Rect,
@@ -25,8 +37,8 @@ pub fn render_wbs(
             Style::default().fg(Color::DarkGray),
         )));
     }
-    let visible = usize::from(area.height.saturating_sub(2));
-    let scroll = selected.saturating_sub(visible.saturating_sub(1));
+    let scroll =
+        SelectableListRegion { area, item_count: lines.len(), selected, row_height: 1 }.scroll();
     let p = Paragraph::new(lines).scroll((scroll as u16, 0)).block(
         Block::default().borders(Borders::ALL).title(" WBS · h/l collapse/expand · Enter details "),
     );

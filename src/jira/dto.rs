@@ -9,6 +9,20 @@ pub struct BoardDto {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct BoardPageDto {
+    #[serde(default, rename = "startAt")]
+    pub start_at: i64,
+    #[serde(default, rename = "maxResults")]
+    pub max_results: i64,
+    #[serde(default)]
+    pub total: i64,
+    #[serde(default, rename = "isLast")]
+    pub is_last: Option<bool>,
+    #[serde(default)]
+    pub values: Vec<BoardDto>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BoardConfigurationDto {
     #[serde(rename = "columnConfig")]
     pub column_config: ColumnConfigDto,

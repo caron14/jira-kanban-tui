@@ -46,6 +46,15 @@ pub fn map_issue(dto: dto::IssueDto, blocked_statuses: &[String]) -> Issue {
             })
     });
 
+    let link_blocked = f.issuelinks.iter().any(|link| {
+        if link.inward_issue.is_none() {
+            return false;
+        }
+        let name = link.link_type.name.to_lowercase();
+        let inward = link.link_type.inward.to_lowercase();
+        name.contains("blocks") || name.contains("blocked") || inward.contains("blocked")
+    });
+
     let links = f
         .issuelinks
         .into_iter()
@@ -56,12 +65,9 @@ pub fn map_issue(dto: dto::IssueDto, blocked_statuses: &[String]) -> Issue {
         })
         .collect::<Vec<_>>();
 
-    // Blocked: status in Blocked column OR link type contains blocks/is blocked by
+    // An inward "Blocks" relation means this Issue is blocked by the linked Issue. An outward
+    // relation means this Issue blocks another one and must not mark this Issue as blocked.
     let status_blocked = blocked_statuses.contains(&f.status.name);
-    let link_blocked = links.iter().any(|l| {
-        let t = l.link_type.to_lowercase();
-        t.contains("blocks") || t.contains("blocked")
-    });
     let blocked = status_blocked || link_blocked;
 
     // Overdue computed with local date (domain::filter will recompute, but store initial)
@@ -131,7 +137,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_via_link() {
+    fn outward_blocker_is_not_itself_blocked() {
         let dto = make_issue_dto(
             "In Progress",
             vec![IssueLinkDto {
@@ -149,6 +155,31 @@ mod tests {
                     fields: None,
                 }),
                 inward_issue: None,
+            }],
+        );
+        let issue = map_issue(dto, &["Blocked".to_string()]);
+        assert!(!issue.blocked);
+    }
+
+    #[test]
+    fn blocked_via_inward_link() {
+        let dto = make_issue_dto(
+            "In Progress",
+            vec![IssueLinkDto {
+                id: "1".into(),
+                link_type: LinkTypeDto {
+                    id: "1".into(),
+                    name: "Blocks".into(),
+                    inward: "is blocked by".into(),
+                    outward: "blocks".into(),
+                },
+                outward_issue: None,
+                inward_issue: Some(LinkedIssueDto {
+                    id: "2".into(),
+                    key: "PROJ-2".into(),
+                    self_url: "".into(),
+                    fields: None,
+                }),
             }],
         );
         let issue = map_issue(dto, &["Blocked".to_string()]);

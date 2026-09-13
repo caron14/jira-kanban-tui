@@ -112,6 +112,26 @@ impl JiraClient {
         self.get_json(&format!("/rest/agile/1.0/board/{}", board_id)).await
     }
 
+    pub async fn get_boards(&self) -> Result<Vec<crate::jira::dto::BoardDto>, JiraError> {
+        let mut start_at = 0_i64;
+        let max_results = 50_i64;
+        let mut boards = Vec::new();
+        loop {
+            let path = format!("/rest/agile/1.0/board?startAt={start_at}&maxResults={max_results}");
+            let page: crate::jira::dto::BoardPageDto = self.get_json(&path).await?;
+            let count = page.values.len() as i64;
+            boards.extend(page.values);
+            if page.is_last == Some(true) || count == 0 || page.start_at + count >= page.total {
+                break;
+            }
+            start_at = page.start_at + count;
+        }
+        boards.sort_by(|left, right| {
+            left.name.to_lowercase().cmp(&right.name.to_lowercase()).then(left.id.cmp(&right.id))
+        });
+        Ok(boards)
+    }
+
     pub async fn get_board_configuration(
         &self,
         board_id: i64,
@@ -190,17 +210,6 @@ impl JiraClient {
                     }
                     for item in history["items"].as_array().into_iter().flatten() {
                         let kind = match item["field"].as_str().unwrap_or_default() {
-                            "status"
-                                if item["toString"]
-                                    .as_str()
-                                    .map(|value| {
-                                        let value = value.to_lowercase();
-                                        value.contains("done") || value.contains("closed")
-                                    })
-                                    .unwrap_or(false) =>
-                            {
-                                ChangeKind::Completed
-                            }
                             "status" => ChangeKind::Status,
                             "assignee" => ChangeKind::Assignee,
                             "duedate" => ChangeKind::DueDate,
@@ -348,6 +357,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn board_discovery_paginates_and_sorts_by_name() {
+        let server = MockServer::start().await;
+        let first_page = (0..50)
+            .map(|index| {
+                serde_json::json!({
+                    "id": index + 1,
+                    "name": format!("Board {:02}", 50 - index),
+                    "type": "kanban"
+                })
+            })
+            .collect::<Vec<_>>();
+        Mock::given(method("GET"))
+            .and(path("/rest/agile/1.0/board"))
+            .and(query_param("startAt", "0"))
+            .and(query_param("maxResults", "50"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "startAt": 0,
+                "maxResults": 50,
+                "total": 51,
+                "isLast": false,
+                "values": first_page
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/agile/1.0/board"))
+            .and(query_param("startAt", "50"))
+            .and(query_param("maxResults", "50"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "startAt": 50,
+                "maxResults": 50,
+                "total": 51,
+                "isLast": true,
+                "values": [{"id": 51, "name": "A Board", "type": "scrum"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = JiraClient::new(server.uri(), "dummy".into()).unwrap();
+        let boards = client.get_boards().await.unwrap();
+        assert_eq!(boards.len(), 51);
+        assert_eq!(boards[0].name, "A Board");
+    }
+
+    #[tokio::test]
     async fn paging_board_issues() {
         let server = MockServer::start().await;
         // page 1
@@ -475,7 +529,7 @@ mod tests {
         let since = chrono::DateTime::parse_from_rfc3339("2026-08-17T00:00:00Z").unwrap().to_utc();
         let items = client.get_board_activity(1, since).await.unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, crate::domain::activity::ChangeKind::Completed);
+        assert_eq!(items[0].kind, crate::domain::activity::ChangeKind::Status);
         assert_eq!(items[0].to.as_deref(), Some("Done"));
     }
 

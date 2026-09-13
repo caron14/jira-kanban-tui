@@ -7,6 +7,27 @@ use ratatui::{
     Frame,
 };
 
+use super::layout::SelectableListRegion;
+
+fn dashboard_chunks(area: Rect) -> Vec<Rect> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Min(7), Constraint::Length(7)])
+        .split(area)
+        .to_vec()
+}
+
+pub fn hit_test(
+    area: Rect,
+    item_count: usize,
+    selected: usize,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    let chunks = dashboard_chunks(area);
+    SelectableListRegion { area: chunks[1], item_count, selected, row_height: 1 }.hit(column, row)
+}
+
 pub fn render_dashboard(
     frame: &mut Frame,
     area: Rect,
@@ -15,10 +36,7 @@ pub fn render_dashboard(
     workload: &[Workload],
     selected: usize,
 ) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(6), Constraint::Min(7), Constraint::Length(7)])
-        .split(area);
+    let chunks = dashboard_chunks(area);
 
     let progress_width = 20usize;
     let filled = ((stats.progress_pct / 100.0) * progress_width as f64).round() as usize;
@@ -43,8 +61,13 @@ pub fn render_dashboard(
         chunks[0],
     );
 
-    let visible = usize::from(chunks[1].height.saturating_sub(2));
-    let scroll = selected.saturating_sub(visible.saturating_sub(1));
+    let scroll = SelectableListRegion {
+        area: chunks[1],
+        item_count: attention.len(),
+        selected,
+        row_height: 1,
+    }
+    .scroll();
     let lines = attention
         .iter()
         .enumerate()

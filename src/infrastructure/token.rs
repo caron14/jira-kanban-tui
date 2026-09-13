@@ -35,18 +35,42 @@ impl TokenProvider for KeyringProvider {
 }
 
 struct CommandProvider(Vec<String>);
+impl CommandProvider {
+    fn get_token_with_timeout(&self, timeout: std::time::Duration) -> Result<Option<String>> {
+        use std::process::Stdio;
+
+        let (program, args) = self.0.split_first().context("empty token command")?;
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if child.try_wait()?.is_some() {
+                let output = child.wait_with_output()?;
+                if !output.status.success() {
+                    anyhow::bail!("token command exited with {}", output.status);
+                }
+                let value = String::from_utf8(output.stdout)?.trim().to_string();
+                return Ok((!value.is_empty()).then_some(value));
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("token command timed out after {} seconds", timeout.as_secs());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+}
+
 impl TokenProvider for CommandProvider {
     fn name(&self) -> &str {
         "external command"
     }
     fn get_token(&self) -> Result<Option<String>> {
-        let (program, args) = self.0.split_first().context("empty token command")?;
-        let output = std::process::Command::new(program).args(args).output()?;
-        if !output.status.success() {
-            anyhow::bail!("token command exited with {}", output.status);
-        }
-        let value = String::from_utf8(output.stdout)?.trim().to_string();
-        Ok((!value.is_empty()).then_some(value))
+        self.get_token_with_timeout(std::time::Duration::from_secs(30))
     }
 }
 
@@ -90,5 +114,21 @@ pub fn redact_token(value: &str, token: &str) -> String {
         value.into()
     } else {
         value.replace(token, "***")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_command_is_terminated_after_timeout() {
+        let provider = CommandProvider(vec!["sleep".into(), "1".into()]);
+        let started = std::time::Instant::now();
+        let error =
+            provider.get_token_with_timeout(std::time::Duration::from_millis(30)).unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }

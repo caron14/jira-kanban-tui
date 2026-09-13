@@ -8,6 +8,7 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::state::AppState;
+use crate::ui::layout::SelectableListRegion;
 
 const MIN_COLUMN_WIDTH: u16 = 24;
 const CARD_HEIGHT: usize = 4;
@@ -22,19 +23,8 @@ pub fn render_board(frame: &mut Frame, area: Rect, state: &AppState) {
         );
         return;
     }
-    let visible_count = usize::from((area.width / MIN_COLUMN_WIDTH).max(1)).min(count);
-    let start = if state.selected_col < state.col_scroll {
-        state.selected_col
-    } else if state.selected_col >= state.col_scroll + visible_count {
-        state.selected_col + 1 - visible_count
-    } else {
-        state.col_scroll.min(count.saturating_sub(visible_count))
-    };
-    let end = (start + visible_count).min(count);
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(vec![Constraint::Ratio(1, (end - start) as u32); end - start])
-        .split(area);
+    let (start, chunks) = column_layout(area, state);
+    let end = start + chunks.len();
 
     for (offset, column_index) in (start..end).enumerate() {
         let issue_indices = state.column_issue_indices(column_index);
@@ -98,13 +88,59 @@ pub fn render_board(frame: &mut Frame, area: Rect, state: &AppState) {
         if lines.is_empty() {
             lines.push(Line::styled("(empty)", Style::default().fg(Color::DarkGray)));
         }
-        let visible_rows = usize::from(chunks[offset].height.saturating_sub(2)) / CARD_HEIGHT;
-        let scroll_row = selected_row.saturating_sub(visible_rows.saturating_sub(1));
+        let scroll_row = SelectableListRegion {
+            area: chunks[offset],
+            item_count: issue_indices.len(),
+            selected: selected_row,
+            row_height: CARD_HEIGHT,
+        }
+        .scroll();
         frame.render_widget(
             Paragraph::new(lines).scroll(((scroll_row * CARD_HEIGHT) as u16, 0)).block(block),
             chunks[offset],
         );
     }
+}
+
+pub fn hit_test(area: Rect, state: &AppState, column: u16, row: u16) -> Option<(usize, usize)> {
+    let (start, chunks) = column_layout(area, state);
+    for (offset, chunk) in chunks.iter().enumerate() {
+        let column_index = start + offset;
+        let issue_indices = state.column_issue_indices(column_index);
+        let selected_row = *state.column_rows.get(column_index).unwrap_or(&0);
+        let region = SelectableListRegion {
+            area: *chunk,
+            item_count: issue_indices.len(),
+            selected: selected_row,
+            row_height: CARD_HEIGHT,
+        };
+        if let Some(issue_row) = region.hit(column, row) {
+            return Some((column_index, issue_row));
+        }
+    }
+    None
+}
+
+fn column_layout(area: Rect, state: &AppState) -> (usize, Vec<Rect>) {
+    let count = state.column_count();
+    if count == 0 {
+        return (0, Vec::new());
+    }
+    let visible_count = usize::from((area.width / MIN_COLUMN_WIDTH).max(1)).min(count);
+    let start = if state.selected_col < state.col_scroll {
+        state.selected_col
+    } else if state.selected_col >= state.col_scroll + visible_count {
+        state.selected_col + 1 - visible_count
+    } else {
+        state.col_scroll.min(count.saturating_sub(visible_count))
+    };
+    let end = (start + visible_count).min(count);
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(vec![Constraint::Ratio(1, (end - start) as u32); end - start])
+        .split(area)
+        .to_vec();
+    (start, chunks)
 }
 
 fn horizontal(text: &str, width: usize) -> String {
