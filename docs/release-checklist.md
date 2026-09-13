@@ -18,16 +18,19 @@
 - [ ] RSS <50 MB
 - [x] 500-Issue Board remains responsive
 - [x] `cargo fmt --all -- --check`
-- [x] `cargo clippy --locked --all-targets -- -D warnings`
-- [x] `cargo test --locked --all-targets`
-- [x] `cargo build --locked --release`
+- [x] `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- [x] `cargo test --locked --all-targets --all-features`
+- [x] `cargo +1.75.0 check --locked --all-features`
+- [x] `cargo build --locked --release --all-features`
+- [x] `cargo audit --file Cargo.lock` reports no vulnerabilities
+- [x] CI and Release workflows pass actionlint
 - [ ] All terminal checks in `docs/compatibility.md`
 
 ## Distribution
 
 - [x] `Cargo.toml` contains the intended release version and the corresponding `vX.Y.Z` tag does
       not already exist
-- [ ] `install.sh` and `tests/install_test.sh` pass ShellCheck
+- [x] `install.sh` and `tests/install_test.sh` pass ShellCheck
 - [x] `tests/install_test.sh`
 - [ ] The Release workflow publishes macOS and Linux archives for x86_64 and arm64
 - [ ] `checksums.txt` contains exactly one SHA-256 checksum for every archive
